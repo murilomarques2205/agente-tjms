@@ -3,13 +3,10 @@
 Para cada órgão em ORGAOS_MONITORADOS:
   1. GET /sessao-agendada (público) → todas as sessões agendadas.
   2. Filtra dtPauta na janela [agora - dias_atras, agora] em UTC.
-  3. Para cada sessão, baixa processos paginados via /processos-em-pauta.
+  3. Para cada sessão, GET /processo-em-pauta (público) com tamanhoPagina=0,
+     que retorna todos os processos da sessão em uma única resposta.
   4. Upsert em sessao + processo_pautado (idempotente).
-  5. Loga métricas em execucao.
-
-Tolerâncias propositais: o shape exato de processos-em-pauta e os nomes
-de campos individuais ainda não foram observados (endpoint protegido).
-Helpers `_extrair_lista` e `_get_field` aceitam variações conhecidas.
+  5. Loga métricas e avisos em execucao.
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ from typing import Any
 
 from dateutil.parser import isoparse
 
-from .client import PAGINACAO_TAMANHO, TJMSClient
+from .client import TJMSClient
 from .config import ORGAOS_MONITORADOS
 from .db import (
     get_conn,
@@ -51,33 +48,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="Não grava em DB; apenas lista o que seria coletado.",
     )
-    p.add_argument(
-        "--com-processos",
-        action="store_true",
-        help=(
-            "Tentar coletar processos por sessão (endpoint protegido por CAS). "
-            "Desabilitado por padrão até implementarmos autenticação."
-        ),
-    )
     return p.parse_args(argv)
 
 
-def _extrair_lista(payload: Any) -> list[dict[str, Any]]:
-    """Extrai a lista de processos do payload paginado, tolerando shapes diferentes."""
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in ("lista", "processos", "items"):
-            if isinstance(payload.get(key), list):
-                return payload[key]
-    raise ValueError(f"shape inesperado em processos-em-pauta: {type(payload).__name__}")
+def _montar_partes_json(p: dict[str, Any]) -> str:
+    """Serializa polos ativo/passivo para a coluna partes_json.
 
+    Cada polo vira null se deTipoPrincParte{Ativa|Passiva} estiver ausente.
+    """
+    def _polo(tipo_key: str, nome_key: str, nome_social_key: str) -> dict[str, Any] | None:
+        tipo = p.get(tipo_key)
+        if tipo is None:
+            return None
+        return {
+            "tipo": tipo,
+            "nome": p.get(nome_key),
+            "nome_social": p.get(nome_social_key),
+        }
 
-def _get_field(d: dict[str, Any], *candidates: str) -> Any:
-    for k in candidates:
-        if k in d:
-            return d[k]
-    return None
+    partes = {
+        "ativa": _polo(
+            "deTipoPrincParteAtiva", "nmPartePrincipalAtiva", "nmSocialPartePrincipalAtiva"
+        ),
+        "passiva": _polo(
+            "deTipoPrincPartePassiva", "nmPartePrincipalPassiva", "nmSocialPartePrincipalPassiva"
+        ),
+    }
+    return json.dumps(partes, ensure_ascii=False)
 
 
 def _coletar_orgao(
@@ -89,9 +86,9 @@ def _coletar_orgao(
     inicio_utc: datetime,
     fim_utc: datetime,
     dry_run: bool,
-    com_processos: bool = False,
-) -> dict[str, int]:
-    """Coleta sessões+processos de um órgão. Retorna {'sessoes': int, 'processos': int}."""
+) -> dict[str, Any]:
+    """Coleta sessões+processos de um órgão. Retorna {sessoes, processos, avisos}."""
+    avisos: list[str] = []
     sessoes_brutas, _ = client.get_sessoes_agendadas(
         cd_foro=cd_foro, cd_orgao_julgador=cd_orgao_julgador
     )
@@ -113,48 +110,50 @@ def _coletar_orgao(
                 dt_pauta_utc=s["dtPauta"],
             )
 
-        if not com_processos:
-            continue  # escopo B: só metadados de sessão (endpoint de processos requer CAS)
-
-        pagina = 0
-        while True:
-            payload, _ = client.get_processos_em_pauta(
-                cd_orgao_julgador=cd_orgao_julgador,
-                nu_sessao=s["nuSessao"],
-                nu_seq_sessao=s["nuSeqSessao"],
-                pagina=pagina,
+        # Uma chamada única: tamanho_pagina=0 faz a API retornar todos os
+        # processos da sessão e preencher paginacao.total.
+        payload, _ = client.get_processo_em_pauta(
+            cd_orgao_julgador=cd_orgao_julgador,
+            nu_sessao=s["nuSessao"],
+            nu_seq_sessao=s["nuSeqSessao"],
+        )
+        processos = payload["processos"]
+        total = (payload.get("paginacao") or {}).get("total")
+        if total is not None and len(processos) != total:
+            aviso = (
+                f"discrepância em sessao {s['nuSessao']}/{s['nuSeqSessao']} "
+                f"(cdOJ={cd_orgao_julgador}): paginacao.total={total}, "
+                f"recebidos={len(processos)}"
             )
-            lista = _extrair_lista(payload)
-            if not lista:
-                break
+            avisos.append(aviso)
+            print(f"  AVISO: {aviso}", file=sys.stderr)
 
-            for p in lista:
-                n_processos += 1
-                if dry_run:
-                    continue
-                assert sessao_id is not None  # garantido: dry_run guarda o upsert acima
-                upsert_processo_pautado(
-                    conn,
-                    sessao_id=sessao_id,
-                    codigo_processo=str(_get_field(p, "codigoProcesso", "cdProcesso")),
-                    numero_unificado=_get_field(
-                        p, "numeroProcessoUnificado", "numeroUnificado", "numero"
-                    ),
-                    classe=_get_field(p, "classe", "nmClasse", "deClasse"),
-                    relator=_get_field(p, "relator", "nmRelator", "desRelator"),
-                    partes_json=json.dumps(
-                        _get_field(p, "partes", "partesProcesso") or [],
-                        ensure_ascii=False,
-                    ),
-                    ordem_pauta=_get_field(p, "ordemPauta", "ordem", "nuOrdem"),
-                    raw_json=json.dumps(p, ensure_ascii=False),
-                )
+        for p in processos:
+            n_processos += 1
+            if dry_run:
+                continue
+            assert sessao_id is not None  # garantido: dry_run faz continue acima
+            upsert_processo_pautado(
+                conn,
+                sessao_id=sessao_id,
+                codigo_processo=p["cdProcesso"],
+                numero_unificado=p.get("nuProcesso"),
+                classe=p.get("deClasse"),
+                relator=p.get("nmMagistrado"),
+                partes_json=_montar_partes_json(p),
+                ordem_pauta=p.get("nuOrdemPauta"),
+                raw_json=json.dumps(p, ensure_ascii=False),
+                de_sit_pauta=p.get("deSitPauta"),
+                assunto=p.get("assunto"),
+                decisao=p.get("decisao"),
+                exibir_decisao=bool(p.get("exibirDecisao", False)),
+                segredo_justica=bool(p.get("tpSegredo", False)),
+                cd_situacao_proc=p.get("cdSituacaoProc"),
+                cd_situacao_julgam=p.get("cdSituacaoJulgam"),
+                url_consulta=p.get("urlDeConsulta"),
+            )
 
-            if len(lista) < PAGINACAO_TAMANHO:
-                break
-            pagina += 1
-
-    return {"sessoes": n_sessoes, "processos": n_processos}
+    return {"sessoes": n_sessoes, "processos": n_processos, "avisos": avisos}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -183,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
 
     metricas_por_orgao: dict[int, dict[str, Any]] = {}
     erros: list[str] = []
+    avisos_globais: list[str] = []
 
     try:
         with TJMSClient() as client:
@@ -196,7 +196,6 @@ def main(argv: list[str] | None = None) -> int:
                             cd_foro=o["cdForo"], cd_orgao_julgador=cd_oj,
                             inicio_utc=inicio_utc, fim_utc=fim_utc,
                             dry_run=True,
-                            com_processos=args.com_processos,
                         )
                     else:
                         with conn:  # transação por órgão
@@ -205,9 +204,9 @@ def main(argv: list[str] | None = None) -> int:
                                 cd_foro=o["cdForo"], cd_orgao_julgador=cd_oj,
                                 inicio_utc=inicio_utc, fim_utc=fim_utc,
                                 dry_run=False,
-                                com_processos=args.com_processos,
                             )
                     metricas_por_orgao[cd_oj] = m
+                    avisos_globais.extend(m.get("avisos", []))
                     print(
                         f"  cdOJ={cd_oj:>3}  {nome}: "
                         f"sessões={m['sessoes']}, processos={m['processos']}"
@@ -231,19 +230,29 @@ def main(argv: list[str] | None = None) -> int:
             status = "erro"
 
         print()
-        print(f"RESUMO: status={status}  sessões={total_sessoes}  processos={total_processos}")
+        print(
+            f"RESUMO: status={status}  sessões={total_sessoes}  "
+            f"processos={total_processos}  avisos={len(avisos_globais)}"
+        )
 
         if not args.dry_run and execucao_id is not None:
+            mensagem_partes: list[str] = []
+            if erros:
+                mensagem_partes.append("ERROS: " + "; ".join(erros))
+            if avisos_globais:
+                mensagem_partes.append("AVISOS: " + "; ".join(avisos_globais))
+            mensagem = " | ".join(mensagem_partes) if mensagem_partes else None
             log_execucao_fim(
                 conn, execucao_id,
                 status=status,
-                mensagem=("; ".join(erros) if erros else None),
+                mensagem=mensagem,
                 metricas={
                     "janela_inicio_utc": inicio_utc.isoformat(),
                     "janela_fim_utc": fim_utc.isoformat(),
                     "total_sessoes": total_sessoes,
                     "total_processos": total_processos,
                     "por_orgao": metricas_por_orgao,
+                    "avisos": avisos_globais,
                 },
             )
         return 0 if status == "ok" else 1

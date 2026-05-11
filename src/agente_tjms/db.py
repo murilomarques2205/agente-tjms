@@ -33,18 +33,26 @@ CREATE TABLE IF NOT EXISTS sessao (
 CREATE INDEX IF NOT EXISTS idx_sessao_dtpauta ON sessao(dt_pauta_utc);
 
 CREATE TABLE IF NOT EXISTS processo_pautado (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    sessao_id         INTEGER NOT NULL REFERENCES sessao(id) ON DELETE CASCADE,
-    codigo_processo   TEXT    NOT NULL,
-    numero_unificado  TEXT,
-    classe            TEXT,
-    relator           TEXT,
-    partes_json       TEXT,
-    ordem_pauta       INTEGER,
-    status_acordao    TEXT    NOT NULL DEFAULT 'pendente',
-    coletado_em       TEXT    NOT NULL,
-    atualizado_em     TEXT    NOT NULL,
-    raw_json          TEXT,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sessao_id           INTEGER NOT NULL REFERENCES sessao(id) ON DELETE CASCADE,
+    codigo_processo     TEXT    NOT NULL,
+    numero_unificado    TEXT,
+    classe              TEXT,
+    relator             TEXT,
+    partes_json         TEXT,
+    ordem_pauta         INTEGER,
+    status_acordao      TEXT    NOT NULL DEFAULT 'pendente',
+    coletado_em         TEXT    NOT NULL,
+    atualizado_em       TEXT    NOT NULL,
+    raw_json            TEXT,
+    de_sit_pauta        TEXT,
+    assunto             TEXT,
+    decisao             TEXT,
+    exibir_decisao      INTEGER NOT NULL DEFAULT 0,
+    segredo_justica     INTEGER NOT NULL DEFAULT 0,
+    cd_situacao_proc    TEXT,
+    cd_situacao_julgam  INTEGER,
+    url_consulta        TEXT,
     UNIQUE (sessao_id, codigo_processo)
 );
 CREATE INDEX IF NOT EXISTS idx_pp_status     ON processo_pautado(status_acordao);
@@ -72,6 +80,20 @@ CREATE TABLE IF NOT EXISTS execucao (
 );
 """
 
+# Colunas adicionadas a processo_pautado depois do schema da Sessão 2.
+# Usado por _migrate() pra aplicar ALTER TABLE ADD COLUMN em DBs antigos.
+# Em DB novo, essas colunas já vêm via CREATE TABLE acima.
+_MIGRACOES_PP: tuple[tuple[str, str], ...] = (
+    ("de_sit_pauta",       "TEXT"),
+    ("assunto",            "TEXT"),
+    ("decisao",            "TEXT"),
+    ("exibir_decisao",     "INTEGER NOT NULL DEFAULT 0"),
+    ("segredo_justica",    "INTEGER NOT NULL DEFAULT 0"),
+    ("cd_situacao_proc",   "TEXT"),
+    ("cd_situacao_julgam", "INTEGER"),
+    ("url_consulta",       "TEXT"),
+)
+
 
 def get_conn(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     """Abre conexão SQLite com row_factory=Row e FKs habilitadas.
@@ -86,10 +108,27 @@ def get_conn(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    """Cria tabelas e índices (idempotente)."""
+def _migrate(conn: sqlite3.Connection) -> list[str]:
+    """ALTER TABLE ADD COLUMN idempotente para colunas novas de processo_pautado.
+
+    Retorna a lista de colunas efetivamente adicionadas (vazia em DB já atualizado).
+    """
+    existentes = {row["name"] for row in conn.execute("PRAGMA table_info(processo_pautado)")}
+    adicionadas: list[str] = []
+    for nome, tipo in _MIGRACOES_PP:
+        if nome not in existentes:
+            conn.execute(f"ALTER TABLE processo_pautado ADD COLUMN {nome} {tipo}")
+            adicionadas.append(nome)
+    if adicionadas:
+        conn.commit()
+    return adicionadas
+
+
+def init_db(conn: sqlite3.Connection) -> list[str]:
+    """Cria tabelas/índices (idempotente) e aplica migrações. Retorna colunas adicionadas."""
     conn.executescript(SCHEMA)
     conn.commit()
+    return _migrate(conn)
 
 
 def _now_iso() -> str:
@@ -152,6 +191,14 @@ def upsert_processo_pautado(
     partes_json: str | None = None,
     ordem_pauta: int | None = None,
     raw_json: str | None = None,
+    de_sit_pauta: str | None = None,
+    assunto: str | None = None,
+    decisao: str | None = None,
+    exibir_decisao: bool = False,
+    segredo_justica: bool = False,
+    cd_situacao_proc: str | None = None,
+    cd_situacao_julgam: int | None = None,
+    url_consulta: str | None = None,
 ) -> int:
     """Retorna o id do processo_pautado.
 
@@ -163,22 +210,36 @@ def upsert_processo_pautado(
         """
         INSERT INTO processo_pautado (
             sessao_id, codigo_processo, numero_unificado, classe, relator,
-            partes_json, ordem_pauta, coletado_em, atualizado_em, raw_json
+            partes_json, ordem_pauta, coletado_em, atualizado_em, raw_json,
+            de_sit_pauta, assunto, decisao, exibir_decisao, segredo_justica,
+            cd_situacao_proc, cd_situacao_julgam, url_consulta
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sessao_id, codigo_processo) DO UPDATE SET
-            numero_unificado = excluded.numero_unificado,
-            classe           = excluded.classe,
-            relator          = excluded.relator,
-            partes_json      = excluded.partes_json,
-            ordem_pauta      = excluded.ordem_pauta,
-            atualizado_em    = excluded.atualizado_em,
-            raw_json         = excluded.raw_json
+            numero_unificado    = excluded.numero_unificado,
+            classe              = excluded.classe,
+            relator             = excluded.relator,
+            partes_json         = excluded.partes_json,
+            ordem_pauta         = excluded.ordem_pauta,
+            atualizado_em       = excluded.atualizado_em,
+            raw_json            = excluded.raw_json,
+            de_sit_pauta        = excluded.de_sit_pauta,
+            assunto             = excluded.assunto,
+            decisao             = excluded.decisao,
+            exibir_decisao      = excluded.exibir_decisao,
+            segredo_justica     = excluded.segredo_justica,
+            cd_situacao_proc    = excluded.cd_situacao_proc,
+            cd_situacao_julgam  = excluded.cd_situacao_julgam,
+            url_consulta        = excluded.url_consulta
         RETURNING id
         """,
         (
             sessao_id, codigo_processo, numero_unificado, classe, relator,
             partes_json, ordem_pauta, now, now, raw_json,
+            de_sit_pauta, assunto, decisao,
+            1 if exibir_decisao else 0,
+            1 if segredo_justica else 0,
+            cd_situacao_proc, cd_situacao_julgam, url_consulta,
         ),
     ).fetchone()
     return row["id"]

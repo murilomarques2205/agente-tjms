@@ -2,8 +2,6 @@
 
 Agente para coletar pautas de julgamento dos órgãos criminais do TJMS, rastrear a publicação de acórdãos correspondentes e gerar relatórios periódicos.
 
-> Este README é o **plano aprovado na Sessão 1 (discovery)** em 2026-05-11. A implementação começa na Sessão 2 — não há código ainda neste repositório.
-
 ## Escopo
 
 Coleta diária das pautas dos **6 órgãos criminais** do TJMS publicadas na semana anterior à execução, com rastreio posterior dos acórdãos.
@@ -35,49 +33,51 @@ Três módulos independentes, compartilhando `config`, `client` HTTP e `db`.
 
 - **SPA Angular/React.** A página de consulta não tem `<form>` HTML — o front é renderizado por `cpaj-bundle-nonIE.js`. A automação chama a API REST diretamente, sem precisar de browser headless.
 - **API base:** `https://esaj.tjms.jus.br/pauta-julgamento/api/1.0`.
-- **Endpoints públicos:** `consulta/orgaos-julgadores`, `sessao-agendada`.
-- **Endpoint protegido:** `processos-em-pauta` retorna `302 → /sajcas/login` sem `JSESSIONID`. O `client` deve fazer **bootstrap de sessão** com um `GET` em `/pauta-julgamento/consulta?servico=526100` antes da primeira chamada protegida.
+- **Endpoints públicos:** `consulta/orgaos-julgadores`, `sessao-agendada`, `processo-em-pauta` (singular). A URL plural `processos-em-pauta` é uma rota de **busca** por critério (`?codigoProcesso=…`, `?nomeParte=…`), não de listagem por sessão — confusão dela com a singular custou a hipótese errada de auth CAS na Sessão 2.
+- **Sem autenticação.** Nenhum dos três endpoints exige `JSESSIONID`. Não há bootstrap.
 - **Filtro por data é client-side.** A API de sessões não aceita parâmetros de data; recebemos todas as sessões agendadas e filtramos pelo campo `dtPauta` (ISO 8601 UTC, convertido para `America/Campo_Grande`).
-- **Cabeçalhos recomendados:** `Accept: application/json`, `Referer: …/pauta-julgamento/consulta?servico=526100`, `User-Agent` realista.
+- **Paginação trivial:** `processo-em-pauta` com `paginacao.tamanhoPagina=0` retorna todos os processos da sessão em uma única resposta + `paginacao.total`. O coletor faz uma chamada por sessão.
+- **Cabeçalhos recomendados:** `Accept: application/json`, `User-Agent` realista.
 
 ## Fluxo end-to-end
 
 1. Cron dispara `python -m agente_tjms coletar` às 07:00.
-2. `client` faz `GET` na página da consulta para obter `JSESSIONID`.
-3. Para cada um dos 6 `cdOrgaoJulgador`, chama `GET /sessao-agendada?cdForo=900&cdOrgaoJulgador=X` e filtra sessões com `dtPauta` em [hoje−7d, hoje].
-4. Para cada sessão filtrada: chama `GET /processos-em-pauta/?cdOrgaoJulgador=X&nuSessao=Y&nuSeqSessao=Z&paginacao.tamanhoPagina=200&paginacao.paginaAtual=N` até esgotar páginas; upsert em `sessao` e `processo_pautado`.
-5. Cron diário 07:30 dispara `rastrear`: para cada `processo_pautado` com `status_acordao='pendente'`, consulta o e-SAJ; ao encontrar o acórdão, grava URL e data em `acordao` e marca o processo como `publicado`.
-6. Cron semanal sexta 18:00 dispara `relatorio`, que faz `JOIN` entre as tabelas e grava `data/relatorios/AAAA-WW.md` + `data/relatorios/AAAA-WW.json`.
-7. Cada execução loga uma linha em `execucao` com métricas e status.
+2. Para cada um dos 6 `cdOrgaoJulgador`, chama `GET /sessao-agendada?cdForo=900&cdOrgaoJulgador=X` e filtra sessões com `dtPauta` em [hoje−7d, hoje].
+3. Para cada sessão filtrada: chama `GET /processo-em-pauta?cdOrgaoJulgador=X&nuSessao=Y&nuSeqSessao=Z&paginacao.tamanhoPagina=0` (resposta única com todos os processos); upsert em `sessao` e `processo_pautado`.
+4. Cron diário 07:30 dispara `rastrear`: para cada `processo_pautado` com `status_acordao='pendente'`, consulta o e-SAJ; ao encontrar o acórdão, grava URL e data em `acordao` e marca o processo como `publicado`.
+5. Cron semanal sexta 18:00 dispara `relatorio`, que faz `JOIN` entre as tabelas e grava `data/relatorios/AAAA-WW.md` + `data/relatorios/AAAA-WW.json`.
+6. Cada execução loga uma linha em `execucao` com métricas, avisos e status.
 
 ## Estrutura de pastas
 
 ```
 agente-tjms/
 ├── README.md                  # este arquivo
-├── pyproject.toml             # (a ser criado na Sessão 2)
+├── pyproject.toml
 ├── .env.example
 ├── .gitignore
 ├── data/
 │   ├── tjms.sqlite            # gerado em runtime
-│   └── relatorios/            # AAAA-WW.md e AAAA-WW.json
+│   └── relatorios/            # AAAA-WW.md e AAAA-WW.json (a partir da Sessão 4)
 ├── logs/
 ├── src/
 │   └── agente_tjms/
 │       ├── __init__.py
+│       ├── __main__.py        # `python -m agente_tjms` → cli.main()
 │       ├── config.py          # IDs dos 6 órgãos, URL base, timezone
-│       ├── client.py          # requests.Session + bootstrap JSESSIONID + retry
-│       ├── db.py              # conexão sqlite3, migrations, helpers upsert
+│       ├── client.py          # requests.Session + retry tenacity (endpoints públicos)
+│       ├── db.py              # conexão sqlite3, schema, migrações, helpers upsert
 │       ├── coletor_pauta.py
-│       ├── rastreador_acordao.py
-│       ├── relatorio.py
-│       └── cli.py             # `python -m agente_tjms coletar|rastrear|relatorio`
+│       ├── rastreador_acordao.py   # (Sessão 4)
+│       ├── relatorio.py            # (Sessão 4)
+│       └── cli.py             # subcomandos init-db | coletar
 ├── scripts/
-│   └── init_db.py             # cria tabelas a partir do schema
+│   └── init_db.py             # cria schema + popula orgao_julgador (29) a partir da fixture
 └── tests/
     ├── fixtures/
-    │   └── orgaos.json        # snapshot real coletado no discovery
-    └── test_*.py
+    │   ├── orgaos.json                    # 29 órgãos reais (snapshot Sessão 1)
+    │   └── processo_em_pauta_sample.json  # 3 processos reais (snapshot Sessão 3)
+    └── test_client.py
 ```
 
 ## Schema SQLite
@@ -114,6 +114,14 @@ CREATE TABLE processo_pautado (
     coletado_em       TEXT    NOT NULL,
     atualizado_em     TEXT    NOT NULL,
     raw_json          TEXT,                        -- payload completo da API
+    de_sit_pauta      TEXT,                        -- deSitPauta: Adiado | Julgado | Pautado
+    assunto           TEXT,                        -- assunto
+    decisao           TEXT,                        -- decisao (texto bruto)
+    exibir_decisao    INTEGER NOT NULL DEFAULT 0,  -- exibirDecisao (0/1)
+    segredo_justica   INTEGER NOT NULL DEFAULT 0,  -- tpSegredo (0/1)
+    cd_situacao_proc  TEXT,                        -- cdSituacaoProc: T (trâmite) | J (julgado)
+    cd_situacao_julgam INTEGER,                    -- cdSituacaoJulgam
+    url_consulta      TEXT,                        -- urlDeConsulta
     UNIQUE (sessao_id, codigo_processo)
 );
 CREATE INDEX idx_pp_status     ON processo_pautado(status_acordao);
@@ -180,8 +188,17 @@ CSV não é gerado.
 - **Saída do relatório: Markdown + JSON simultâneos.** Sem CSV.
 - **Stack HTTP: `requests` + `tenacity` + `bs4` + `lxml`.** Não substituir por `httpx`.
 
+_Acrescidos na Sessão 3 (correção da premissa errada da Sessão 2):_
+
+- **Endpoint correto: `/processo-em-pauta` (singular), público.** A URL plural era rota de busca por critério (`?codigoProcesso=…`), não de listagem por sessão; a hipótese de CAS caiu.
+- **`paginacao.tamanhoPagina=0` retorna toda a sessão em uma resposta.** Uma chamada HTTP por sessão; coletor não pagina.
+- **8 colunas novas em `processo_pautado`** cobrem `deSitPauta`, `assunto`, `decisao`, `exibirDecisao`, `tpSegredo`, `cdSituacaoProc`, `cdSituacaoJulgam`, `urlDeConsulta`.
+- **`partes_json` estruturado** como `{"ativa": {tipo,nome,nome_social}|null, "passiva": ...}` em vez de array bruto.
+- **Migração via `_migrate()` idempotente** (`ALTER TABLE ADD COLUMN` por coluna nova, gateada por `PRAGMA table_info`).
+
 ## Status
 
-- ✅ **Sessão 1 — discovery + plano** (2026-05-11). Endpoints mapeados, IDs dos 6 órgãos confirmados, fixture `orgaos.json` salva em `tests/fixtures/`.
-- ⏳ **Sessão 2 — implementação inicial**: `config`, `client` (com bootstrap de sessão), `db`, `scripts/init_db.py`, `coletor_pauta` MVP e testes unitários sobre as fixtures.
-- ⏳ **Sessão 3+ — `rastreador_acordao`, `relatorio`, agendamento (cron) e observabilidade.**
+- ✅ **Sessão 1 — discovery + plano** (2026-05-11). Endpoints mapeados, IDs dos 6 órgãos confirmados, fixture `orgaos.json` salva.
+- ✅ **Sessão 2 — scaffolding** (2026-05-11). Pacote, schema inicial, client, coletor, cli, init-db, 4 testes verdes. Coleta operou em escopo B reduzido (só `sessao`) por hipótese errada de auth no endpoint plural.
+- ✅ **Sessão 3 — endpoint correto + schema expandido** (2026-05-11). `/processo-em-pauta` (singular, público), 8 colunas novas, fixture `processo_em_pauta_sample.json`. Primeira coleta completa real (sessões + processos).
+- ⏳ **Sessão 4+ — `rastreador_acordao`, `relatorio`, agendamento (cron), observabilidade.**

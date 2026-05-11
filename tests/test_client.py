@@ -5,13 +5,19 @@ from __future__ import annotations
 import json
 
 import pytest
+import requests
 import responses
 
-from agente_tjms.client import API_BASE, PAUTA_JULGAMENTO_PATH, TJMSClient
+from agente_tjms.client import API_BASE, TJMSClient
 from agente_tjms.config import BASE_URL, PROJECT_ROOT
 
 FIXTURE_ORGAOS = json.loads(
     (PROJECT_ROOT / "tests" / "fixtures" / "orgaos.json").read_text(encoding="utf-8")
+)
+FIXTURE_PROCESSO = json.loads(
+    (PROJECT_ROOT / "tests" / "fixtures" / "processo_em_pauta_sample.json").read_text(
+        encoding="utf-8"
+    )
 )
 
 
@@ -28,77 +34,52 @@ def test_get_orgaos_julgadores_retorna_lista_e_raw_text():
 
     assert isinstance(orgaos, list)
     assert len(orgaos) == 29
-    # Os 6 cdOrgaoJulgador alvo devem aparecer na lista.
     assert {o["cdOrgaoJulgador"] for o in orgaos} >= {8, 9, 49, 51, 52, 53}
-    # raw_text é o corpo cru — deve poder ser reparseado e bater com o JSON parseado.
     assert json.loads(raw) == FIXTURE_ORGAOS
 
 
 @responses.activate
-def test_get_processos_em_pauta_dispara_bootstrap_implicito():
+def test_get_processo_em_pauta_retorna_processos_e_paginacao():
     responses.add(
         responses.GET,
-        f"{BASE_URL}{PAUTA_JULGAMENTO_PATH}/consulta",
-        body="<html>...</html>",
-        status=200,
-        headers={"Set-Cookie": "JSESSIONID=abc123; path=/pauta-julgamento"},
-    )
-    responses.add(
-        responses.GET,
-        f"{BASE_URL}{API_BASE}/processos-em-pauta/",
-        json={"lista": [{"codigoProcesso": "X"}]},
+        f"{BASE_URL}{API_BASE}/processo-em-pauta",
+        json=FIXTURE_PROCESSO,
         status=200,
     )
-
     with TJMSClient() as client:
-        assert client._sessao_estabelecida is False
-        data, _raw = client.get_processos_em_pauta(
+        payload, raw = client.get_processo_em_pauta(
             cd_orgao_julgador=8, nu_sessao=1546, nu_seq_sessao=20523
         )
-        assert client._sessao_estabelecida is True
 
-    assert data == {"lista": [{"codigoProcesso": "X"}]}
-    assert len(responses.calls) == 2
-    assert "/pauta-julgamento/consulta" in responses.calls[0].request.url
-    assert "/processos-em-pauta/" in responses.calls[1].request.url
+    assert payload["paginacao"]["total"] == 3
+    assert len(payload["processos"]) == 3
 
+    p1 = payload["processos"][0]
+    assert p1["cdProcesso"] == "P0000SGQR0000"
+    assert p1["tpSegredo"] is True
+    assert p1["deSitPauta"] == "Adiado"
 
-@responses.activate
-def test_bootstrap_falha_se_sem_jsessionid():
-    # 200 OK mas sem Set-Cookie -> nenhum JSESSIONID na Session.cookies
-    responses.add(
-        responses.GET,
-        f"{BASE_URL}{PAUTA_JULGAMENTO_PATH}/consulta",
-        body="<html>manutenção</html>",
-        status=200,
-    )
+    # Processo 9 é sparse: várias chaves estão ausentes do JSON
+    p9 = payload["processos"][2]
+    assert p9["cdProcesso"] == "P0000SOW10000"
+    assert "nuProcesso" not in p9
+    assert "nmPartePrincipalAtiva" not in p9
 
-    with TJMSClient() as client:
-        with pytest.raises(RuntimeError, match="JSESSIONID"):
-            client.bootstrap_sessao()
-        assert client._sessao_estabelecida is False
+    assert json.loads(raw) == FIXTURE_PROCESSO
 
 
 @responses.activate
-def test_processos_em_pauta_falha_se_redireciona_para_cas():
-    # Bootstrap OK
+def test_get_processo_em_pauta_propaga_404():
     responses.add(
         responses.GET,
-        f"{BASE_URL}{PAUTA_JULGAMENTO_PATH}/consulta",
-        body="ok",
-        status=200,
-        headers={"Set-Cookie": "JSESSIONID=abc; path=/pauta-julgamento"},
+        f"{BASE_URL}{API_BASE}/processo-em-pauta",
+        json={"erro": "sessao inexistente"},
+        status=404,
     )
-    # Endpoint protegido ainda redireciona para CAS (cookie inválido/expirado simulado)
-    responses.add(
-        responses.GET,
-        f"{BASE_URL}{API_BASE}/processos-em-pauta/",
-        status=302,
-        headers={"Location": f"{BASE_URL}/sajcas/login?service=..."},
-    )
-
     with TJMSClient() as client:
-        with pytest.raises(RuntimeError, match="CAS"):
-            client.get_processos_em_pauta(
-                cd_orgao_julgador=8, nu_sessao=1, nu_seq_sessao=1
+        with pytest.raises(requests.exceptions.HTTPError) as exc_info:
+            client.get_processo_em_pauta(
+                cd_orgao_julgador=8, nu_sessao=99999, nu_seq_sessao=99999
             )
+
+    assert exc_info.value.response.status_code == 404
