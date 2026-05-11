@@ -1,0 +1,17 @@
+# runtime data
+data/
+logs/
+
+# secrets
+.env
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# tool caches
+.pytest_cache/
+.ruff_cache/
+
+# virtual env
+.venv/
