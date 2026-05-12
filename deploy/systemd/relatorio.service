@@ -1,0 +1,7 @@
+[Unit]
+Description=agente-tjms: relatório semanal
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projetos/agente-tjms
+ExecStart=%h/projetos/agente-tjms/.venv/bin/agente-tjms relatorio

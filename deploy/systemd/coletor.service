@@ -1,0 +1,7 @@
+[Unit]
+Description=agente-tjms: coletor diário de pautas
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projetos/agente-tjms
+ExecStart=%h/projetos/agente-tjms/.venv/bin/agente-tjms coletar --dias-atras 7

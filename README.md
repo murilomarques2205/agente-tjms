@@ -25,9 +25,9 @@ Três módulos independentes, compartilhando `config`, `client` HTTP e `db`.
 
 | Módulo | Responsabilidade | Periodicidade |
 |---|---|---|
-| `coletor_pauta` | Para cada órgão, lista sessões agendadas, filtra `dtPauta ∈ [hoje−7d, hoje]` e coleta os processos paginados; upsert em `sessao` + `processo_pautado`. | **Diário, 07:00** — idempotente; protege contra remarcação de sessão de última hora. |
-| `rastreador_acordao` | Para cada `processo_pautado` com `status_acordao='pendente'`, consulta o e-SAJ; grava URL do PDF do acórdão (sem extrair texto agora). | Diário, 07:30. |
-| `relatorio` | Lê o DB e gera Markdown + JSON consolidados em `data/relatorios/`. | Semanal, sexta 18:00. |
+| `coletor_pauta` | Para cada órgão, lista sessões agendadas, filtra `dtPauta ∈ [hoje−7d, hoje]` e coleta os processos paginados; upsert em `sessao` + `processo_pautado`. | **Diário, 04:30** — idempotente; protege contra remarcação de sessão de última hora. |
+| `rastreador_acordao` | Para cada `processo_pautado` com `status_acordao` em `pendente`/`julgado_sem_acordao`, baixa o HTML CPOSG5 e extrai ementa inline; upsert em `acordao` e atualiza `status_acordao`. Cap de 10 tentativas por processo. | Diário, 21:00. |
+| `relatorio` | Lê o DB e gera Markdown (com redação de privacidade) + JSON (íntegro) em `data/relatorios/{AAAA-WW}.{md,json}`. Filtro: `dt_publicacao_dje` na semana civil anterior. | Semanal, segunda 07:00. |
 
 ### Particularidades técnicas (descobertas no discovery)
 
@@ -41,11 +41,11 @@ Três módulos independentes, compartilhando `config`, `client` HTTP e `db`.
 
 ## Fluxo end-to-end
 
-1. Cron dispara `python -m agente_tjms coletar` às 07:00.
+1. **systemd-timer** (user) dispara `agente-tjms coletar` às 04:30 (diário).
 2. Para cada um dos 6 `cdOrgaoJulgador`, chama `GET /sessao-agendada?cdForo=900&cdOrgaoJulgador=X` e filtra sessões com `dtPauta` em [hoje−7d, hoje].
 3. Para cada sessão filtrada: chama `GET /processo-em-pauta?cdOrgaoJulgador=X&nuSessao=Y&nuSeqSessao=Z&paginacao.tamanhoPagina=0` (resposta única com todos os processos); upsert em `sessao` e `processo_pautado`.
-4. Cron diário 07:30 dispara `rastrear`: para cada `processo_pautado` com `status_acordao='pendente'`, consulta o e-SAJ; ao encontrar o acórdão, grava URL e data em `acordao` e marca o processo como `publicado`.
-5. Cron semanal sexta 18:00 dispara `relatorio`, que faz `JOIN` entre as tabelas e grava `data/relatorios/AAAA-WW.md` + `data/relatorios/AAAA-WW.json`.
+4. Às 21:00 (diário) dispara `agente-tjms rastrear-acordaos`: para cada `processo_pautado` em `pendente`/`julgado_sem_acordao` com `tentativas_rastreador < 10`, baixa o HTML CPOSG5 e extrai a ementa inline; upsert em `acordao` (`status='publicado'`) ou atualiza `status_acordao` (`sob_segredo` / `julgado_sem_acordao` / `pendente`).
+5. Segunda 07:00 dispara `agente-tjms relatorio`: filtra `acordao.dt_publicacao_dje` na semana civil anterior (seg-dom TZ Campo Grande) e grava `data/relatorios/{AAAA-WW}.md` + `.json`.
 6. Cada execução loga uma linha em `execucao` com métricas, avisos e status.
 
 ## Estrutura de pastas
@@ -195,6 +195,47 @@ _Acrescidos na Sessão 3 (correção da premissa errada da Sessão 2):_
 - **8 colunas novas em `processo_pautado`** cobrem `deSitPauta`, `assunto`, `decisao`, `exibirDecisao`, `tpSegredo`, `cdSituacaoProc`, `cdSituacaoJulgam`, `urlDeConsulta`.
 - **`partes_json` estruturado** como `{"ativa": {tipo,nome,nome_social}|null, "passiva": ...}` em vez de array bruto.
 - **Migração via `_migrate()` idempotente** (`ALTER TABLE ADD COLUMN` por coluna nova, gateada por `PRAGMA table_info`).
+
+## Agendamento (systemd-timer, user)
+
+Os 3 jobs rodam como **user units** do systemd (sem `sudo`, sem root). Pré-requisitos: projeto em `~/projetos/agente-tjms/` com `.venv/` configurado (`pip install -e ".[dev]"`). Se seu layout difere, edite `WorkingDirectory` e `ExecStart` nos `.service` antes de instalar.
+
+```bash
+# 1. copiar units pro diretório de user systemd
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/*.service deploy/systemd/*.timer ~/.config/systemd/user/
+
+# 2. recarregar systemd
+systemctl --user daemon-reload
+
+# 3. ativar e iniciar os 3 timers
+systemctl --user enable --now coletor.timer rastreador.timer relatorio.timer
+
+# 4. (servidor/laptop) habilitar lingering pra rodar sem sessão aberta
+loginctl enable-linger $USER
+```
+
+Verificação:
+
+```bash
+systemctl --user list-timers                      # próximas execuções agendadas
+journalctl --user -u coletor.service -n 50        # logs da última execução
+systemctl --user start coletor.service            # rodar manualmente sem esperar o timer
+```
+
+Desinstalar:
+
+```bash
+systemctl --user disable --now coletor.timer rastreador.timer relatorio.timer
+rm ~/.config/systemd/user/{coletor,rastreador,relatorio}.{service,timer}
+systemctl --user daemon-reload
+```
+
+Notas:
+- `Persistent=true` nos timers faz catch-up se a máquina estava desligada na hora marcada (roda quando ligar).
+- `RandomizedDelaySec=10min` no coletor + rastreador distribui carga no e-SAJ.
+- **WSL2**: precisa `systemd=true` em `/etc/wsl.conf`; timers só correm enquanto o WSL está em execução.
+- **Observabilidade futura**: dá pra acoplar `OnFailure=alerta@%n.service` quando o módulo de alertas existir.
 
 ## Status
 
