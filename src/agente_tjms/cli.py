@@ -3,6 +3,7 @@
 Subcomandos:
   init-db   Inicializa schema e popula orgao_julgador a partir do fixture.
   coletar   Coleta sessões/processos dos órgãos monitorados.
+  rastrear-acordaos  Visita o CPOSG5 dos processos pendentes e detecta acórdão publicado.
 
 Invocação: `python -m agente_tjms <subcomando>` ou `agente-tjms <subcomando>`.
 
@@ -16,7 +17,7 @@ import argparse
 import json
 import sys
 
-from . import coletor_pauta
+from . import coletor_pauta, rastreador_acordao
 from .config import DB_PATH, ORGAOS_MONITORADOS, PROJECT_ROOT
 from .db import get_conn, init_db, upsert_orgao
 
@@ -65,6 +66,7 @@ def _print_help() -> None:
     print("subcomandos:")
     print("  init-db   Cria schema do SQLite e popula orgao_julgador.")
     print("  coletar   Coleta sessões/processos dos órgãos monitorados.")
+    print("  rastrear-acordaos  Detecta acórdão publicado nos processos pendentes.")
     print()
     print("Para opções de cada subcomando: agente-tjms <subcomando> --help")
 
@@ -84,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init_db(rest)
     if sub == "coletar":
         return coletor_pauta.main(rest)
+    if sub == "rastrear-acordaos":
+        return rastreador_acordao.main(rest)
     print(f"subcomando desconhecido: {sub}", file=sys.stderr)
     _print_help()
     return 2
