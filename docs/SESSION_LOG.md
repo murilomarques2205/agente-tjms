@@ -158,3 +158,41 @@ Log cronológico das sessões. Append-only. Para detalhes técnicos correntes, v
 - **Observabilidade**: alerta para `execucao.status != 'ok'` (carry-over).
 - Re-runs do rastreador ao longo das semanas: dos 161 `pendente` e 19 `julgado_sem_acordao` da S4, parte deve virar `publicado` quando o DJE sair. Cap de 10 tentativas modera o esforço.
 - Captura opcional do `Número do Diário Eletrônico` (campo identificado no HTML CPOSG5 mas não capturado).
+
+## Sessão 6 — Agendamento via systemd-timer (2026-05-12)
+
+**Objetivo:** instalar os 3 jobs como serviços recorrentes via systemd-timer (user units, sem root).
+
+### Decisões de produto
+
+- 3 pares service+timer (coletor diário, rastreador diário, relatório semanal segunda).
+- **User units** (sem `sudo`), instalados em `~/.config/systemd/user/`.
+- Localização no repo: `deploy/systemd/` (vs `scripts/` que já existia pra Python utilitário). Permite `deploy/docker/` ou outros no futuro sem renomear.
+- **Horários:**
+  - coletor 04:30 (madrugada, fora janela de manutenção típica do e-SAJ);
+  - rastreador 21:00 (após expediente do tribunal e publicações do dia no DJE);
+  - relatório segunda 07:00 (semana civil anterior fechada; default `--semana` aplica).
+- `Persistent=true` em todos (catch-up se máquina desligada na hora marcada).
+- `RandomizedDelaySec=10min` no coletor + rastreador (distribui carga no e-SAJ); sem randomização no relatório (operação local, sem rede).
+
+### Implementação
+
+- 6 arquivos em `deploy/systemd/` (3 `.service` oneshot + 3 `.timer`).
+- Units usam `%h/projetos/agente-tjms` como path padrão (variável do systemd que resolve pra `$HOME`); doc diz pra editar `WorkingDirectory`/`ExecStart` se o layout local diferir.
+- Todos passaram `systemd-analyze verify` (exit 0, sem warnings) — confirma sintaxe e dependências corretas.
+
+### Atualização do README
+
+- Nova seção **"Agendamento (systemd-timer, user)"** com bloco de instalação (`mkdir -p` + `cp` + `daemon-reload` + `enable --now` + `loginctl enable-linger`), verificação (`list-timers`, `journalctl`, start manual) e desinstalação.
+- Tabela `### Arquitetura`: 3 linhas atualizadas (horários novos + descrições refletindo o que S4/S5 implementaram, ex.: rastreador menciona cap de 10 tentativas, relatório menciona redação de privacidade).
+- Bloco `## Fluxo end-to-end`: cron → systemd-timer e horários atualizados (eram 07:00/07:30/sexta 18:00, agora 04:30/21:00/segunda 07:00).
+- Nota explícita sobre **WSL2**: precisa `systemd=true` em `/etc/wsl.conf`; timers só correm enquanto o WSL está em execução.
+- Gancho documentado pra observabilidade futura: `OnFailure=alerta@%n.service` quando o módulo de alertas existir.
+
+**Saídas:** 6 units + README atualizado. 1 commit em `main` (sha `458e687`).
+
+**Pendências para Sessão 7+:**
+- **Observabilidade**: alerta para `execucao.status != 'ok'`. Única pendência **operacional** restante do plano original. Possível abordagem: gerar `alerta@.service` parametrizado que envia notificação (email / webhook / journald-only) e referenciar via `OnFailure=` nos 3 services existentes.
+- Re-runs do rastreador (carry-over de S4/S5).
+- Captura opcional do `Número do Diário Eletrônico` (carry-over).
+- Possível revisão geral do README pra atualizar seções desatualizadas (schema, estrutura de pastas, dependências marcadas como pendentes mas já usadas) — fora do escopo S6.
