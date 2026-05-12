@@ -8,8 +8,16 @@ o texto da ementa.
 
 from __future__ import annotations
 
+import argparse
 import re
+import sqlite3
+import sys
+import time
+from datetime import datetime
 from html import unescape
+
+from .client import TJMSClient
+from .db import get_conn, log_execucao_fim, log_execucao_inicio
 
 # Form de senha em vez de movimentações = processo sob segredo de justiça
 _SENTINEL_SEGREDO = re.compile(
@@ -125,3 +133,201 @@ def parse_html(html: str) -> dict:
         "dt_julgamento": None,
         "dt_publicacao_dje": None,
     }
+
+
+# ==== Orquestrador ====
+
+MAX_TENTATIVAS = 10
+THROTTLE_S_DEFAULT = 0.8
+STATUS_PROCESSAVEIS = ("pendente", "julgado_sem_acordao")
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _data_br_para_iso(dt: str | None) -> str | None:
+    """Converte 'DD/MM/AAAA' para 'AAAA-MM-DD'. None passa direto."""
+    if dt is None:
+        return None
+    return datetime.strptime(dt, "%d/%m/%Y").strftime("%Y-%m-%d")
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="rastreador_acordao",
+        description="Visita o CPOSG5 dos processos pendentes pra detectar acórdão publicado.",
+    )
+    p.add_argument(
+        "--limite", type=int, default=None,
+        help="Máximo de processos a processar nesta execução (default: todos da fila).",
+    )
+    p.add_argument(
+        "--throttle", type=float, default=THROTTLE_S_DEFAULT,
+        help=f"Segundos de espera entre requests (default: {THROTTLE_S_DEFAULT}).",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="Não grava no DB; só classifica e imprime contadores.",
+    )
+    return p.parse_args(argv)
+
+
+def selecionar_fila(
+    conn: sqlite3.Connection, *, limite: int | None = None
+) -> list[sqlite3.Row]:
+    """Retorna processos elegíveis pro rastreamento.
+
+    Critério: status em ('pendente', 'julgado_sem_acordao'), tentativas < MAX,
+    url_consulta não-nula. Ordenado por menos tentativas primeiro.
+    """
+    sql = """
+        SELECT id, codigo_processo, url_consulta, status_acordao, tentativas_rastreador
+          FROM processo_pautado
+         WHERE status_acordao IN (?, ?)
+           AND tentativas_rastreador < ?
+           AND url_consulta IS NOT NULL AND url_consulta != ''
+         ORDER BY tentativas_rastreador ASC, id ASC
+    """
+    params: list = [*STATUS_PROCESSAVEIS, MAX_TENTATIVAS]
+    if limite is not None:
+        sql += " LIMIT ?"
+        params.append(limite)
+    return conn.execute(sql, params).fetchall()
+
+
+def aplicar_resultado(
+    conn: sqlite3.Connection, processo_pautado_id: int, resultado: dict
+) -> None:
+    """Persiste o retorno do parse_html.
+
+    Sempre atualiza processo_pautado (status, tentativas++, ultimo_rastreio_em).
+    Se status='publicado', upsert em acordao.
+    """
+    agora = _now_iso()
+    conn.execute(
+        """
+        UPDATE processo_pautado
+           SET status_acordao        = ?,
+               tentativas_rastreador = tentativas_rastreador + 1,
+               ultimo_rastreio_em    = ?,
+               atualizado_em         = ?
+         WHERE id = ?
+        """,
+        (resultado["status"], agora, agora, processo_pautado_id),
+    )
+    if resultado["status"] == "publicado":
+        conn.execute(
+            """
+            INSERT INTO acordao (
+                processo_pautado_id, dt_julgamento, dt_publicacao_dje,
+                ementa, cd_documento, capturado_em
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(processo_pautado_id) DO UPDATE SET
+                dt_julgamento     = excluded.dt_julgamento,
+                dt_publicacao_dje = excluded.dt_publicacao_dje,
+                ementa            = excluded.ementa,
+                cd_documento      = excluded.cd_documento,
+                capturado_em      = excluded.capturado_em
+            """,
+            (
+                processo_pautado_id,
+                _data_br_para_iso(resultado["dt_julgamento"]),
+                _data_br_para_iso(resultado["dt_publicacao_dje"]),
+                resultado["ementa"],
+                resultado["cd_documento_acordao"],
+                agora,
+            ),
+        )
+
+
+def _registrar_erro(conn: sqlite3.Connection, processo_pautado_id: int) -> None:
+    """Incrementa tentativas mesmo em erro pra evitar loop infinito."""
+    agora = _now_iso()
+    conn.execute(
+        """
+        UPDATE processo_pautado
+           SET tentativas_rastreador = tentativas_rastreador + 1,
+               ultimo_rastreio_em    = ?,
+               atualizado_em         = ?
+         WHERE id = ?
+        """,
+        (agora, agora, processo_pautado_id),
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    conn = get_conn()
+    execucao_id = None if args.dry_run else log_execucao_inicio(conn, "rastreador_acordao")
+
+    contadores = {
+        "publicado": 0, "julgado_sem_acordao": 0,
+        "sob_segredo": 0, "pendente": 0, "erro": 0,
+    }
+    erros: list[str] = []
+
+    try:
+        fila = selecionar_fila(conn, limite=args.limite)
+        print(f"fila: {len(fila)} processos  (limite={args.limite}, dry_run={args.dry_run})")
+        print()
+
+        with TJMSClient() as client:
+            for i, row in enumerate(fila, 1):
+                try:
+                    html = client.baixar_pagina_processo(row["url_consulta"])
+                    resultado = parse_html(html)
+                    status = resultado["status"]
+                    if not args.dry_run:
+                        with conn:  # transação por processo
+                            aplicar_resultado(conn, row["id"], resultado)
+                    contadores[status] += 1
+                    print(
+                        f"  [{i:>3}/{len(fila)}] {row['codigo_processo']} → {status}"
+                    )
+                except Exception as e:
+                    contadores["erro"] += 1
+                    erros.append(f"{row['codigo_processo']}: {e}")
+                    if not args.dry_run:
+                        with conn:
+                            _registrar_erro(conn, row["id"])
+                    print(
+                        f"  [{i:>3}/{len(fila)}] {row['codigo_processo']} → ERRO: {e}",
+                        file=sys.stderr,
+                    )
+
+                if i < len(fila):
+                    time.sleep(args.throttle)
+
+        if contadores["erro"] == 0:
+            status_global = "ok"
+        elif contadores["erro"] < len(fila):
+            status_global = "parcial"
+        else:
+            status_global = "erro"
+
+        print()
+        print(
+            f"RESUMO: status={status_global}  total={len(fila)}  "
+            + "  ".join(f"{k}={v}" for k, v in contadores.items())
+        )
+
+        if execucao_id is not None:
+            log_execucao_fim(
+                conn, execucao_id,
+                status=status_global,
+                mensagem=("; ".join(erros[:5]) + (f" (+{len(erros)-5})" if len(erros) > 5 else "")) if erros else None,
+                metricas={
+                    "total": len(fila),
+                    "limite": args.limite,
+                    "throttle_s": args.throttle,
+                    "contadores": contadores,
+                },
+            )
+        return 0 if status_global == "ok" else 1
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
