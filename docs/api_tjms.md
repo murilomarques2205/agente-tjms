@@ -120,3 +120,71 @@ com menos metadados. O coletor usa `.get()` para todos exceto `cdProcesso` (obri
 
 - `GET /sessao-julgamento?nuSessao=…&nuSeqSessao=…&cdOrgaoJulgador=…` — detalhe da sessão.
 - `GET/POST /pedidos-sustentacao/…` — fluxo de sustentação oral (requer login).
+
+## CPOSG5 — página HTML do processo (rastreador de acórdão)
+
+Usado por `rastreador_acordao.py` (Sessão 4) para detectar publicação de
+acórdão e capturar ementa inline — sem necessidade de baixar PDF do
+inteiro teor.
+
+**URL:** `https://esaj.tjms.jus.br/cposg5/search.do?processo.codigo={cdProcesso}&...`
+
+Vem pronta no campo `urlDeConsulta` da API `/processo-em-pauta` e fica
+armazenada em `processo_pautado.url_consulta`. Pública, sem login.
+
+**Resposta:** HTML do "Consulta de Processos do 2º Grau" (~30-120kb).
+`Content-Type` vem com `charset=utf-8` em produção (mocks de teste
+precisam declarar explicitamente — caso contrário `requests` cai em
+ISO-8859-1).
+
+### Sentinels usados pelo parser `parse_html(html) -> dict`
+
+| `status` retornado | Como detectar |
+|---|---|
+| `sob_segredo` | HTML contém `name="senhaProcesso"` ou classe `orientacao-senha-parte`; zero `<tr class="movimentacaoProcesso">` |
+| `publicado` | Alguma `<tr class="movimentacaoProcesso">` traz `<span style="font-style: italic;">` cujo conteúdo contém `Ementa:` |
+| `julgado_sem_acordao` | Não tem ementa inline, mas existe a movimentação `Julgamento Virtual Finalizado` |
+| `pendente` | Nenhum dos sinais acima — processo ainda não julgado |
+
+### Caminho primário vs secundário
+
+O texto da ementa pode aparecer em **duas movimentações** do mesmo processo:
+
+- **Primário** — `<span>Ementa: ...</span>` (acórdão em si; descrição típica
+  "Não-Provimento", "Provimento", "Parcial Provimento", etc.). É o registro
+  com `cdDocumento` apontando para o PDF do voto.
+- **Secundário** — `<span>Teor do ato: &quot;Ementa: ...&quot;</span>` ou
+  variante multilinha `<span>Publicado em DD/MM/AAAA\nNúmero do Diário
+  Eletrônico: NNNN\nTeor do ato: Ementa: ...</span>` (Certidão de Publicação
+  no DJE). O `cdDocumento` aqui é o PDF da Certidão, não do voto.
+
+O parser prefere o primário pra `cd_documento_acordao` e `ementa`. As datas
+saem separadas (e ambas nullable independentemente):
+
+- `dt_julgamento` — data do `<td class="dataMovimentacaoProcesso">` da
+  movimentação primária. Tipicamente o dia em que o julgamento virtual
+  encerrou.
+- `dt_publicacao_dje` — data análoga da movimentação secundária. Tipicamente
+  o dia útil seguinte ao julgamento.
+
+### Outras peculiaridades
+
+- **2 `<tbody>` redundantes**: o HTML emite a tabela de movimentações na
+  visível e em `<tbody id="tabelaTodasMovimentacoes" style="display:none;">`
+  com todas as movimentações. Parser deduplica mantendo só a primeira
+  ocorrência de cada tipo (primário/secundário).
+- **Unescape**: `&Ccedil;` → `Ç`, `&Atilde;` → `Ã`, `&quot;` → `"` etc.
+  já vem normalizado pelo parser via `html.unescape`.
+- **`Número do Acórdão` não aparece no HTML público** (confirmado por
+  grep). O `Número do Diário Eletrônico` aparece dentro do span secundário
+  mas não é capturado hoje.
+- **Sessão virtual concluída** é sinalizada pelo texto literal `Julgamento
+  Virtual Finalizado` em alguma movimentação (sem link).
+
+### Validação em produção
+
+Run real em 2026-05-12 sobre os 365 processos da coleta S3:
+- 365 HTTP 200, 0 erros
+- Distribuição: `publicado=64`, `julgado_sem_acordao=19`, `sob_segredo=121`, `pendente=161`
+- Tempo total ~5min com `--throttle 0.8`
+- 64/64 acórdãos detectados tinham **ambas** as datas preenchidas (em prod, primário e secundário coexistem; cenários "só primário" / "só secundário" ficam só nos testes sintéticos)
