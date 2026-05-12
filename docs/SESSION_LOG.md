@@ -196,3 +196,49 @@ Log cronológico das sessões. Append-only. Para detalhes técnicos correntes, v
 - Re-runs do rastreador (carry-over de S4/S5).
 - Captura opcional do `Número do Diário Eletrônico` (carry-over).
 - Possível revisão geral do README pra atualizar seções desatualizadas (schema, estrutura de pastas, dependências marcadas como pendentes mas já usadas) — fora do escopo S6.
+
+## Sessão 7 — Observabilidade: alerta Telegram (2026-05-12)
+
+**Objetivo:** fechar a única pendência operacional restante do plano original (S3): alerta quando algum job falha. Usuário pediu **veredito recomendado** (sem menu de opções) — abaixo, decisões diretas.
+
+### Decisões de produto
+
+- **Canal: Telegram bot.** Push real-time pro celular, 1 endpoint HTTP (`api.telegram.org/sendMessage`), zero infra extra. Setup uma vez via @BotFather (~5min). Descartados: email via MTA local (precisa relay/SPF/DKIM — overhead pra alertas raros) e webhook genérico (sem consumer estabelecido).
+- **Gatilho: `OnFailure=alerta@%N.service`** nos 3 services existentes. Pega exit ≠ 0 do CLI (que já reflete `status_global ∈ {parcial, erro}`), Python exception não-tratada, OOM, signals. Sem código Python adicional — desacoplado do agente; trocar canal no futuro não toca no orquestrador.
+- **Payload em 3 blocos truncados a 3500 chars** (limite Telegram 4096): `job + host + timestamp`; última row de `execucao` (modulo, status, mensagem); `journalctl --user -u <unit> -n 15`.
+
+### Implementação
+
+- `deploy/systemd/alerta@.service` — template oneshot. `EnvironmentFile=-%h/.config/agente-tjms.env` (prefixo `-` = opcional: sem o env file, alerta falha silenciosamente).
+- `deploy/systemd/alerta.sh` — bash com `set -euo pipefail`; usa expansão `${X:?msg}` pra exigir vars; query do DB via `.venv/bin/python` em heredoc (evita dependência do `sqlite3` CLI); `curl --max-time 10`.
+- `deploy/systemd/agente-tjms.env.example` — placeholders dos 3 campos (`AGENTE_TJMS_HOME`, `_TG_TOKEN`, `_TG_CHAT_ID`). Usuário copia pra `~/.config/agente-tjms.env` (gitignored por estar fora do repo) com `chmod 600`.
+- Edição nos 3 services existentes: linha `OnFailure=alerta@%N.service` em `[Unit]`. `%N` resolve sem extensão (ex.: `coletor`), então o template é instanciado como `alerta@coletor.service`.
+
+### Validação
+
+- `systemd-analyze verify` nos 4 units (3 modificados + `alerta@.service`): exit 0, sem warnings.
+- `bash -n` no `alerta.sh`: OK (sintaxe limpa).
+- Suite pytest 21/21 verde (sem alterações em código Python; só checkpoint).
+- **Não testado em produção real**: requer bot do usuário e env file preenchido. README inclui teste manual via `systemctl --user start alerta@coletor.service` que força um disparo sem esperar falha real.
+
+### Atualização do README
+
+- Subseção `### Alertas via Telegram (opcional)` dentro de `## Agendamento`, com passo-a-passo de setup (bot via @BotFather + `getUpdates` + `cp env` + `chmod 600` + `cp template` + `daemon-reload`), explicação de "como funciona" e nota sobre falha silenciosa sem env.
+- Linha de "Observabilidade futura" das Notas substituída por ponteiro pra subseção.
+
+**Saídas:** 3 arquivos novos em `deploy/systemd/` + 3 services modificados + README estendido. 1 commit em `main` (sha `d0cd7de`).
+
+### Plano original fechado
+
+Com a S7, **todas as pendências operacionais do plano original (S3) foram entregues**:
+- ✅ Coletor diário (timer 04:30)
+- ✅ Rastreador diário (timer 21:00, cap 10 tentativas)
+- ✅ Relatório semanal (timer segunda 07:00, com redação de privacidade)
+- ✅ Alerta de falha (OnFailure → Telegram, opcional)
+
+A partir daqui o projeto entra em fase de operação: os 3 timers rodam, problemas virão da operação real.
+
+**Pendências carregadas pra S8+ (não-bloqueantes):**
+- Re-runs naturais do rastreador ao longo das semanas: a fila de `pendente`/`julgado_sem_acordao` reduz à medida que DJEs saem. Cap de 10 tentativas modera o esforço. **Acontece sozinho via timer** — só observar.
+- Captura opcional do `Número do Diário Eletrônico` (carry-over).
+- **Revisão geral do README**: seções desatualizadas (`### Particularidades técnicas`, schema completo, estrutura de pastas, dependências como `pdfplumber`/`bs4` marcadas como uso futuro mas o parser usa só regex puro). Não é blocker mas evita confusão.
