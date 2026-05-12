@@ -1,5 +1,6 @@
 [Unit]
 Description=agente-tjms: relatório semanal
+OnFailure=alerta@%N.service
 
 [Service]
 Type=oneshot

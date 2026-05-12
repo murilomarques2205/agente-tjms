@@ -235,7 +235,40 @@ Notas:
 - `Persistent=true` nos timers faz catch-up se a máquina estava desligada na hora marcada (roda quando ligar).
 - `RandomizedDelaySec=10min` no coletor + rastreador distribui carga no e-SAJ.
 - **WSL2**: precisa `systemd=true` em `/etc/wsl.conf`; timers só correm enquanto o WSL está em execução.
-- **Observabilidade futura**: dá pra acoplar `OnFailure=alerta@%n.service` quando o módulo de alertas existir.
+- **Observabilidade**: alertas opcionais via Telegram quando algum job falha — ver subseção abaixo.
+
+### Alertas via Telegram (opcional)
+
+Quando um service falha (`exit != 0`, exception Python, OOM etc.), o systemd dispara `alerta@<job>.service`, que envia um sumário pra um bot Telegram. Sem o env file presente, o alerta falha silenciosamente — os jobs continuam normalmente.
+
+Setup (uma vez):
+
+```bash
+# 1. criar bot e descobrir chat_id
+#    - no Telegram: @BotFather → /newbot → siga as instruções → guarde o TOKEN
+#    - dê /start no novo bot pelo seu Telegram
+#    - rode:  curl "https://api.telegram.org/bot${TOKEN}/getUpdates"
+#      e copie result[0].message.chat.id da resposta
+
+# 2. instalar config gitignored
+mkdir -p ~/.config
+cp deploy/systemd/agente-tjms.env.example ~/.config/agente-tjms.env
+chmod 600 ~/.config/agente-tjms.env
+$EDITOR ~/.config/agente-tjms.env   # preencher AGENTE_TJMS_HOME, _TG_TOKEN, _TG_CHAT_ID
+
+# 3. instalar template do alerta
+cp deploy/systemd/alerta@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# 4. (opcional) testar disparo manual sem esperar uma falha real
+systemctl --user start alerta@coletor.service
+journalctl --user -u alerta@coletor.service -n 20
+```
+
+Como funciona:
+- Cada um dos 3 services existentes tem `OnFailure=alerta@%N.service` em `[Unit]`. Quando termina com `exit != 0`, systemd instancia o template.
+- O template lê `~/.config/agente-tjms.env`, invoca `deploy/systemd/alerta.sh <job>`, que monta o payload (última row de `execucao` + últimas 15 linhas do journal) e faz `curl` pro Telegram.
+- Falhas do próprio alerta (token inválido, sem rede) ficam no journal de `alerta@<job>.service` e não afetam os jobs originais.
 
 ## Status
 
