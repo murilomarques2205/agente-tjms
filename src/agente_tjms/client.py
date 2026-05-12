@@ -47,9 +47,16 @@ class TJMSClient:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         reraise=True,
     )
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> requests.Response:
-        url = f"{self.base_url}{path}"
-        resp = self._session.get(url, params=params, timeout=self.timeout)
+    def _get(
+        self,
+        path_or_url: str,
+        params: dict[str, Any] | None = None,
+        *,
+        accept: str | None = None,
+    ) -> requests.Response:
+        url = path_or_url if path_or_url.startswith("http") else f"{self.base_url}{path_or_url}"
+        headers = {"Accept": accept} if accept else None
+        resp = self._session.get(url, params=params, timeout=self.timeout, headers=headers)
         if 500 <= resp.status_code < 600:
             raise requests.exceptions.HTTPError(
                 f"{resp.status_code} server error at {url}", response=resp
@@ -99,6 +106,18 @@ class TJMSClient:
         )
         resp.raise_for_status()
         return resp.json(), resp.text
+
+    def baixar_pagina_processo(self, url: str) -> str:
+        """Baixa o HTML da página do processo no CPOSG5 (e-SAJ).
+
+        Endpoint público (sem login). url é a urlDeConsulta da API
+        /processo-em-pauta, salva como processo_pautado.url_consulta.
+        Usado pelo rastreador de acórdãos pra extrair ementa inline
+        (sem necessidade de baixar o PDF do inteiro teor).
+        """
+        resp = self._get(url, accept="text/html,*/*;q=0.9")
+        resp.raise_for_status()
+        return resp.text
 
     def close(self) -> None:
         self._session.close()

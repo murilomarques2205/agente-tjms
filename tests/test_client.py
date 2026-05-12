@@ -83,3 +83,25 @@ def test_get_processo_em_pauta_propaga_404():
             )
 
     assert exc_info.value.response.status_code == 404
+
+
+@responses.activate
+def test_baixar_pagina_processo_retorna_html_cru():
+    url = (
+        "https://esaj.tjms.jus.br/cposg5/search.do"
+        "?processo.codigo=P0000SMB70000&paginaConsulta=1"
+    )
+    html_fixture = (
+        PROJECT_ROOT / "tests" / "fixtures" / "cposg_proc_julgado.html"
+    ).read_text(encoding="utf-8")
+    responses.add(
+        responses.GET, url, body=html_fixture, status=200,
+        content_type="text/html; charset=utf-8",
+    )
+
+    with TJMSClient() as client:
+        html = client.baixar_pagina_processo(url)
+
+    assert html == html_fixture
+    assert "Não-Provimento" in html  # sanity: fixture real do julgado
+    assert "Ementa: DIREITO PENAL" in html
