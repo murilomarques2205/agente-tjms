@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS processo_pautado (
     cd_situacao_proc    TEXT,
     cd_situacao_julgam  INTEGER,
     url_consulta        TEXT,
+    tentativas_rastreador INTEGER NOT NULL DEFAULT 0,
+    ultimo_rastreio_em    TEXT,
     UNIQUE (sessao_id, codigo_processo)
 );
 CREATE INDEX IF NOT EXISTS idx_pp_status     ON processo_pautado(status_acordao);
@@ -61,9 +63,10 @@ CREATE INDEX IF NOT EXISTS idx_pp_numero_cnj ON processo_pautado(numero_unificad
 CREATE TABLE IF NOT EXISTS acordao (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     processo_pautado_id INTEGER NOT NULL REFERENCES processo_pautado(id) ON DELETE CASCADE,
-    dt_publicacao       TEXT,
-    numero_acordao      TEXT,
+    dt_julgamento       TEXT,
+    dt_publicacao_dje   TEXT,
     ementa              TEXT,
+    cd_documento        INTEGER,
     url_pdf             TEXT,
     capturado_em        TEXT    NOT NULL,
     UNIQUE (processo_pautado_id)
@@ -92,6 +95,20 @@ _MIGRACOES_PP: tuple[tuple[str, str], ...] = (
     ("cd_situacao_proc",   "TEXT"),
     ("cd_situacao_julgam", "INTEGER"),
     ("url_consulta",       "TEXT"),
+    # S4 — controle de fila do rastreador
+    ("tentativas_rastreador", "INTEGER NOT NULL DEFAULT 0"),
+    ("ultimo_rastreio_em",    "TEXT"),
+)
+
+# S4 — migração da tabela acordao: alinhar com retorno do parser CPOSG5.
+# numero_acordao sai (não existe no HTML); dt_publicacao vira dt_publicacao_dje.
+_MIGRACOES_ACORDAO_DROP:   tuple[str, ...]              = ("numero_acordao",)
+_MIGRACOES_ACORDAO_ADD:    tuple[tuple[str, str], ...]  = (
+    ("dt_julgamento", "TEXT"),
+    ("cd_documento",  "INTEGER"),
+)
+_MIGRACOES_ACORDAO_RENAME: tuple[tuple[str, str], ...]  = (
+    ("dt_publicacao", "dt_publicacao_dje"),
 )
 
 
@@ -109,19 +126,40 @@ def get_conn(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
 
 
 def _migrate(conn: sqlite3.Connection) -> list[str]:
-    """ALTER TABLE ADD COLUMN idempotente para colunas novas de processo_pautado.
+    """ALTER TABLE idempotente para processo_pautado e acordao.
 
-    Retorna a lista de colunas efetivamente adicionadas (vazia em DB já atualizado).
+    Retorna lista de operações aplicadas (prefixadas por tabela). Vazia em DB já atualizado.
     """
-    existentes = {row["name"] for row in conn.execute("PRAGMA table_info(processo_pautado)")}
-    adicionadas: list[str] = []
+    mudancas: list[str] = []
+
+    # processo_pautado: ADD COLUMN
+    cols_pp = {row["name"] for row in conn.execute("PRAGMA table_info(processo_pautado)")}
     for nome, tipo in _MIGRACOES_PP:
-        if nome not in existentes:
+        if nome not in cols_pp:
             conn.execute(f"ALTER TABLE processo_pautado ADD COLUMN {nome} {tipo}")
-            adicionadas.append(nome)
-    if adicionadas:
+            mudancas.append(f"processo_pautado.+{nome}")
+
+    # acordao: DROP / ADD / RENAME
+    cols_ac = {row["name"] for row in conn.execute("PRAGMA table_info(acordao)")}
+    for nome in _MIGRACOES_ACORDAO_DROP:
+        if nome in cols_ac:
+            conn.execute(f"ALTER TABLE acordao DROP COLUMN {nome}")
+            cols_ac.discard(nome)
+            mudancas.append(f"acordao.-{nome}")
+    for nome, tipo in _MIGRACOES_ACORDAO_ADD:
+        if nome not in cols_ac:
+            conn.execute(f"ALTER TABLE acordao ADD COLUMN {nome} {tipo}")
+            cols_ac.add(nome)
+            mudancas.append(f"acordao.+{nome}")
+    for antigo, novo in _MIGRACOES_ACORDAO_RENAME:
+        if antigo in cols_ac and novo not in cols_ac:
+            conn.execute(f"ALTER TABLE acordao RENAME COLUMN {antigo} TO {novo}")
+            cols_ac.discard(antigo); cols_ac.add(novo)
+            mudancas.append(f"acordao.{antigo}->{novo}")
+
+    if mudancas:
         conn.commit()
-    return adicionadas
+    return mudancas
 
 
 def init_db(conn: sqlite3.Connection) -> list[str]:
