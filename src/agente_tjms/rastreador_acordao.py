@@ -45,19 +45,21 @@ def parse_html(html: str) -> dict:
     Retorna dict com chaves:
       status: 'publicado' | 'julgado_sem_acordao' | 'sob_segredo' | 'pendente'
       ementa: str ou None  (já html-unescaped)
-      cd_documento: int ou None
-      data_publicacao: str 'DD/MM/AAAA' ou None
+      cd_documento_acordao: int ou None  (cd da movimentação primária; cai pro secundário só se primário ausente)
+      dt_julgamento: str 'DD/MM/AAAA' ou None  (data da movimentação primária — acórdão em si)
+      dt_publicacao_dje: str 'DD/MM/AAAA' ou None  (data da movimentação secundária — Certidão/Publicação no DJE)
     """
     if _SENTINEL_SEGREDO.search(html):
         return {
             "status": "sob_segredo",
             "ementa": None,
-            "cd_documento": None,
-            "data_publicacao": None,
+            "cd_documento_acordao": None,
+            "dt_julgamento": None,
+            "dt_publicacao_dje": None,
         }
 
-    achados_primarios: list[dict] = []   # <span>Ementa: ...</span> (acórdão em si)
-    achados_secundarios: list[dict] = [] # <span>Teor do ato: "Ementa: ..."</span> (Certidão DJE)
+    primario: dict | None = None    # <span>Ementa: ...</span> (acórdão em si)
+    secundario: dict | None = None  # <span>...Teor do ato:...Ementa:...</span> (Certidão DJE / Publicação)
     tem_julgamento_virtual = False
 
     for tr in _TR_MOVIMENTACAO.finditer(html):
@@ -71,7 +73,11 @@ def parse_html(html: str) -> dict:
             if idx == -1:
                 continue
 
-            primario = conteudo[:idx].strip() == ""
+            eh_primario = conteudo[:idx].strip() == ""
+            # Mantém só o primeiro de cada tipo (CPOSG5 lista em ordem reversa-cronológica,
+            # então o primeiro é o acórdão mais recente).
+            if (eh_primario and primario is not None) or (not eh_primario and secundario is not None):
+                break
 
             ementa_raw = conteudo[idx:]
             if ementa_raw.endswith("&quot;"):
@@ -82,28 +88,40 @@ def parse_html(html: str) -> dict:
             data_match = _DATA_MOVIMENTACAO.search(bloco)
 
             achado = {
-                "status": "publicado",
                 "ementa": ementa,
                 "cd_documento": int(cd_match.group(1)) if cd_match else None,
-                "data_publicacao": data_match.group(1) if data_match else None,
+                "data": data_match.group(1) if data_match else None,
             }
-            (achados_primarios if primario else achados_secundarios).append(achado)
+            if eh_primario:
+                primario = achado
+            else:
+                secundario = achado
             break  # 1 ementa por movimentação basta
 
-    if achados_primarios:
-        return achados_primarios[0]
-    if achados_secundarios:
-        return achados_secundarios[0]
+    if primario is not None or secundario is not None:
+        # Ementa/cd_documento vêm preferencialmente do primário (acórdão em si);
+        # cai pro secundário só se primário não existir.
+        fonte = primario or secundario
+        return {
+            "status": "publicado",
+            "ementa": fonte["ementa"],
+            "cd_documento_acordao": fonte["cd_documento"],
+            "dt_julgamento": primario["data"] if primario else None,
+            "dt_publicacao_dje": secundario["data"] if secundario else None,
+        }
+
     if tem_julgamento_virtual:
         return {
             "status": "julgado_sem_acordao",
             "ementa": None,
-            "cd_documento": None,
-            "data_publicacao": None,
+            "cd_documento_acordao": None,
+            "dt_julgamento": None,
+            "dt_publicacao_dje": None,
         }
     return {
         "status": "pendente",
         "ementa": None,
-        "cd_documento": None,
-        "data_publicacao": None,
+        "cd_documento_acordao": None,
+        "dt_julgamento": None,
+        "dt_publicacao_dje": None,
     }

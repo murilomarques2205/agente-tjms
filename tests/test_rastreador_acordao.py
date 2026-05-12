@@ -13,8 +13,9 @@ def test_julgado_publicado_extrai_ementa_e_cd_documento_do_acordao():
     out = parse_html(html)
 
     assert out["status"] == "publicado"
-    assert out["cd_documento"] == 26
-    assert out["data_publicacao"] == "11/05/2026"
+    assert out["cd_documento_acordao"] == 26
+    assert out["dt_julgamento"] == "11/05/2026"       # movimentação primária ("Não-Provimento")
+    assert out["dt_publicacao_dje"] == "12/05/2026"   # Certidão DJE secundária
     assert out["ementa"].startswith("Ementa: DIREITO PENAL")
     assert "APELAÇÃO" in out["ementa"]
     assert "&Ccedil;" not in out["ementa"]
@@ -26,8 +27,9 @@ def test_em_tramite_retorna_pendente():
     assert parse_html(html) == {
         "status": "pendente",
         "ementa": None,
-        "cd_documento": None,
-        "data_publicacao": None,
+        "cd_documento_acordao": None,
+        "dt_julgamento": None,
+        "dt_publicacao_dje": None,
     }
 
 
@@ -36,8 +38,9 @@ def test_segredo_de_justica_detectado_por_form_de_senha():
     assert parse_html(html) == {
         "status": "sob_segredo",
         "ementa": None,
-        "cd_documento": None,
-        "data_publicacao": None,
+        "cd_documento_acordao": None,
+        "dt_julgamento": None,
+        "dt_publicacao_dje": None,
     }
 
 
@@ -57,8 +60,9 @@ def test_julgamento_virtual_finalizado_sem_ementa_inline_retorna_julgado_sem_aco
     assert parse_html(html) == {
         "status": "julgado_sem_acordao",
         "ementa": None,
-        "cd_documento": None,
-        "data_publicacao": None,
+        "cd_documento_acordao": None,
+        "dt_julgamento": None,
+        "dt_publicacao_dje": None,
     }
 
 
@@ -76,9 +80,10 @@ def test_dedupe_entre_tbodies_pega_so_a_primeira_ocorrencia():
     html = "<html><body><table><tbody>" + mov + "</tbody><tbody id='tabelaTodasMovimentacoes'>" + mov + "</tbody></table></body></html>"
     out = parse_html(html)
     assert out["status"] == "publicado"
-    assert out["cd_documento"] == 99
+    assert out["cd_documento_acordao"] == 99
     assert out["ementa"] == "Ementa: TESTE."
-    assert out["data_publicacao"] == "11/05/2026"
+    assert out["dt_julgamento"] == "11/05/2026"
+    assert out["dt_publicacao_dje"] is None  # sintético só tem movimentação primária
 
 
 def test_fallback_secundario_quando_so_ha_certidao_dje():
@@ -96,6 +101,7 @@ def test_fallback_secundario_quando_so_ha_certidao_dje():
     """
     out = parse_html(html)
     assert out["status"] == "publicado"
-    assert out["cd_documento"] == 33
+    assert out["cd_documento_acordao"] == 33  # secundário vira fonte do cd quando primário ausente
     assert out["ementa"] == "Ementa: FALLBACK."
-    assert out["data_publicacao"] == "12/05/2026"
+    assert out["dt_julgamento"] is None  # sintético não tem movimentação primária
+    assert out["dt_publicacao_dje"] == "12/05/2026"
