@@ -116,3 +116,45 @@ Log cronológico das sessões. Append-only. Para detalhes técnicos correntes, v
 - Observabilidade — alerta para `execucao.status != 'ok'` (carry-over).
 - Re-runs do rastreador ao longo das semanas: dos 161 `pendente` e 19 `julgado_sem_acordao`, parte deve virar `publicado` quando o DJE sair. Cap de 10 tentativas modera o esforço por processo.
 - Capturar `Número do Diário Eletrônico` se virar útil pra rastreabilidade (campo identificado mas não capturado).
+
+## Sessão 5 — Relatório semanal (2026-05-12)
+
+**Objetivo:** implementar `relatorio.py`, último item do plano original da S3 que ainda estava aberto.
+
+### Discovery e alinhamento de produto
+
+- Inventário rápido do DB (64 acórdãos da S4 publicados em 11-12/05): toda a publicação no DJE concentrada em 2 dias; `dt_julgamento` distribui em 20 itens na semana civil anterior, mas `dt_publicacao_dje` zera nela.
+- **Descoberta major:** 64/64 acórdãos com `exibir_decisao=0`, **0/64** com `segredo_justica=1`. A flag tinha duas leituras possíveis: (a) restringe só o campo `decisao` da API pauta-julgamento; (b) sinal geral de restrição que vale pra tudo derivado.
+- Decisões consolidadas (3 AskUserQuestion):
+  1. **Conteúdo**: só acórdãos publicados na semana.
+  2. **Privacidade**: leitura (b) conservadora — `exibir_decisao=0` redata partes + ementa + decisão no MD (JSON sempre íntegro).
+  3. **Janela**: semana civil anterior (seg-dom no TZ `America/Campo_Grande`).
+- **Critério principal**: `dt_publicacao_dje` na janela. Implicação aceita: relatório alterna entre "0 acórdãos" e "muitos", refletindo a cadência real do DJE.
+
+### Implementação
+
+- Módulo `src/agente_tjms/relatorio.py` (~283 linhas):
+  - `calcular_janela(hoje, semana_iso=None)` — TZ-aware; suporta override por semana ISO.
+  - `selecionar_acordaos(conn, de, ate)` — JOIN `acordao + processo_pautado + sessao + orgao_julgador`.
+  - `aplicar_privacidade(processo)` — redata se restrito; mantém metadados.
+  - `gerar_json` e `gerar_md` — JSON sempre íntegro; MD respeita redação.
+  - `main()` com `--semana`, `--de/--ate`, `--saida-dir`, `--dry-run` (padrão `coletor_pauta`).
+- Subcomando `agente-tjms relatorio` em `cli.py` (mesma estrutura dos outros).
+- 11 testes em `tests/test_relatorio.py`: 5 cobrem `calcular_janela` (incluindo virada de ano ISO 2025→2026); 3 cobrem `aplicar_privacidade`; 3 cobrem geração.
+
+### Validação em produção
+
+- `relatorio --dry-run` (semana civil anterior 04-10/05): 0 acórdãos, MD diz "Nenhum acórdão publicado nesta semana" — esperado.
+- `relatorio --de 2026-05-11 --ate 2026-05-12`: 64 acórdãos da S4 exercitados, arquivos persistidos em `data/relatorios/2026-W20-ad-hoc.{md,json}` (gitignored).
+- Cross-check:
+  - MD 15kb, 192 marcadores `[REDATADO]` (3 por acórdão), metadados visíveis, agrupado por 2 órgãos (únicos com publicação na janela).
+  - JSON 313kb com partes nomeadas e ementas inteiras (até 6678 chars).
+- Suite 21/21 verde.
+
+**Saídas:** `relatorio.py` + 11 testes + subcomando CLI + 1 relatório real (gitignored). 1 commit em `main` (sha `f3ff198`).
+
+**Pendências para Sessão 6+:**
+- **Agendamento** (cron / systemd-timer): coletor diário + rastreador diário + relatório semanal — único item original do plano da S3 que ainda não foi atacado.
+- **Observabilidade**: alerta para `execucao.status != 'ok'` (carry-over).
+- Re-runs do rastreador ao longo das semanas: dos 161 `pendente` e 19 `julgado_sem_acordao` da S4, parte deve virar `publicado` quando o DJE sair. Cap de 10 tentativas modera o esforço.
+- Captura opcional do `Número do Diário Eletrônico` (campo identificado no HTML CPOSG5 mas não capturado).
