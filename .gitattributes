@@ -1,0 +1,3 @@
+# Projeto roda em Linux/WSL — normaliza todo arquivo de texto para LF,
+# evitando que o git no Windows introduza CRLF.
+* text=auto eol=lf

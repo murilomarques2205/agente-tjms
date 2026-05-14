@@ -15,3 +15,6 @@ __pycache__/
 
 # virtual env
 .venv/
+
+# ferramenta local (Claude Code)
+.claude/
