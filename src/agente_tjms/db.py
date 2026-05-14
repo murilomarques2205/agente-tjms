@@ -154,7 +154,8 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
     for antigo, novo in _MIGRACOES_ACORDAO_RENAME:
         if antigo in cols_ac and novo not in cols_ac:
             conn.execute(f"ALTER TABLE acordao RENAME COLUMN {antigo} TO {novo}")
-            cols_ac.discard(antigo); cols_ac.add(novo)
+            cols_ac.discard(antigo)
+            cols_ac.add(novo)
             mudancas.append(f"acordao.{antigo}->{novo}")
 
     if mudancas:

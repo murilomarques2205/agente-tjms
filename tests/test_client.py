@@ -76,11 +76,13 @@ def test_get_processo_em_pauta_propaga_404():
         json={"erro": "sessao inexistente"},
         status=404,
     )
-    with TJMSClient() as client:
-        with pytest.raises(requests.exceptions.HTTPError) as exc_info:
-            client.get_processo_em_pauta(
-                cd_orgao_julgador=8, nu_sessao=99999, nu_seq_sessao=99999
-            )
+    with (
+        TJMSClient() as client,
+        pytest.raises(requests.exceptions.HTTPError) as exc_info,
+    ):
+        client.get_processo_em_pauta(
+            cd_orgao_julgador=8, nu_sessao=99999, nu_seq_sessao=99999
+        )
 
     assert exc_info.value.response.status_code == 404
 

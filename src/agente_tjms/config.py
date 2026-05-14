@@ -31,10 +31,16 @@ TZ_TRIBUNAL: ZoneInfo = ZoneInfo(os.environ.get("TZ", "America/Campo_Grande"))
 # Snapshot fixo dos 6 órgãos criminais alvo, confirmados no discovery (Sessão 1).
 # Estrutura idêntica à da resposta do endpoint /consulta/orgaos-julgadores.
 ORGAOS_MONITORADOS: tuple[dict[str, int | str], ...] = (
-    {"cdForo": 900, "cdOrgaoJulgador": 8,  "nmOrgaoJulgador": "1ª Câmara Criminal - Tribunal de Justiça"},
-    {"cdForo": 900, "cdOrgaoJulgador": 9,  "nmOrgaoJulgador": "2ª Câmara Criminal - Tribunal de Justiça"},
-    {"cdForo": 900, "cdOrgaoJulgador": 49, "nmOrgaoJulgador": "3ª Câmara Criminal - Tribunal de Justiça"},
-    {"cdForo": 900, "cdOrgaoJulgador": 53, "nmOrgaoJulgador": "1ª Seção Criminal - Tribunal de Justiça"},
-    {"cdForo": 900, "cdOrgaoJulgador": 51, "nmOrgaoJulgador": "2ª Seção Criminal - Tribunal de Justiça"},
-    {"cdForo": 900, "cdOrgaoJulgador": 52, "nmOrgaoJulgador": "Seção Especial - Criminal - Tribunal de Justiça"},
+    {"cdForo": 900, "cdOrgaoJulgador": 8,
+     "nmOrgaoJulgador": "1ª Câmara Criminal - Tribunal de Justiça"},
+    {"cdForo": 900, "cdOrgaoJulgador": 9,
+     "nmOrgaoJulgador": "2ª Câmara Criminal - Tribunal de Justiça"},
+    {"cdForo": 900, "cdOrgaoJulgador": 49,
+     "nmOrgaoJulgador": "3ª Câmara Criminal - Tribunal de Justiça"},
+    {"cdForo": 900, "cdOrgaoJulgador": 53,
+     "nmOrgaoJulgador": "1ª Seção Criminal - Tribunal de Justiça"},
+    {"cdForo": 900, "cdOrgaoJulgador": 51,
+     "nmOrgaoJulgador": "2ª Seção Criminal - Tribunal de Justiça"},
+    {"cdForo": 900, "cdOrgaoJulgador": 52,
+     "nmOrgaoJulgador": "Seção Especial - Criminal - Tribunal de Justiça"},
 )
