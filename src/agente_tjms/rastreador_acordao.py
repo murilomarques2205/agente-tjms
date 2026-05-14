@@ -13,9 +13,10 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import unescape
 
+from . import telegram
 from .client import TJMSClient
 from .db import get_conn, log_execucao_fim, log_execucao_inicio
 
@@ -53,9 +54,12 @@ def parse_html(html: str) -> dict:
     Retorna dict com chaves:
       status: 'publicado' | 'julgado_sem_acordao' | 'sob_segredo' | 'pendente'
       ementa: str ou None  (já html-unescaped)
-      cd_documento_acordao: int ou None  (cd da movimentação primária; cai pro secundário só se primário ausente)
-      dt_julgamento: str 'DD/MM/AAAA' ou None  (data da movimentação primária — acórdão em si)
-      dt_publicacao_dje: str 'DD/MM/AAAA' ou None  (data da movimentação secundária — Certidão/Publicação no DJE)
+      cd_documento_acordao: int ou None  (cd da movimentação primária;
+          cai pro secundário só se o primário estiver ausente)
+      dt_julgamento: str 'DD/MM/AAAA' ou None  (data da movimentação
+          primária — acórdão em si)
+      dt_publicacao_dje: str 'DD/MM/AAAA' ou None  (data da movimentação
+          secundária — Certidão/Publicação no DJE)
     """
     if _SENTINEL_SEGREDO.search(html):
         return {
@@ -67,7 +71,8 @@ def parse_html(html: str) -> dict:
         }
 
     primario: dict | None = None    # <span>Ementa: ...</span> (acórdão em si)
-    secundario: dict | None = None  # <span>...Teor do ato:...Ementa:...</span> (Certidão DJE / Publicação)
+    # secundário: <span>...Teor do ato:...Ementa:...</span> (Certidão DJE / Publicação)
+    secundario: dict | None = None
     tem_julgamento_virtual = False
 
     for tr in _TR_MOVIMENTACAO.finditer(html):
@@ -84,7 +89,9 @@ def parse_html(html: str) -> dict:
             eh_primario = conteudo[:idx].strip() == ""
             # Mantém só o primeiro de cada tipo (CPOSG5 lista em ordem reversa-cronológica,
             # então o primeiro é o acórdão mais recente).
-            if (eh_primario and primario is not None) or (not eh_primario and secundario is not None):
+            if (eh_primario and primario is not None) or (
+                not eh_primario and secundario is not None
+            ):
                 break
 
             ementa_raw = conteudo[idx:]
@@ -137,7 +144,13 @@ def parse_html(html: str) -> dict:
 
 # ==== Orquestrador ====
 
-MAX_TENTATIVAS = 10
+# Fase diária: tentativas < TENTATIVAS_FASE_DIARIA (rastreio todo dia).
+# Fase semanal: até MAX_TENTATIVAS_ABSOLUTO, 1x a cada INTERVALO_SEMANAL_DIAS.
+# A partir de MAX_TENTATIVAS_ABSOLUTO o processo sai da fila (abandonado).
+TENTATIVAS_FASE_DIARIA = 10
+SEMANAS_FASE_SEMANAL = 26  # ~6 meses
+MAX_TENTATIVAS_ABSOLUTO = TENTATIVAS_FASE_DIARIA + SEMANAS_FASE_SEMANAL
+INTERVALO_SEMANAL_DIAS = 7
 THROTTLE_S_DEFAULT = 0.8
 STATUS_PROCESSAVEIS = ("pendente", "julgado_sem_acordao")
 
@@ -174,22 +187,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def selecionar_fila(
-    conn: sqlite3.Connection, *, limite: int | None = None
+    conn: sqlite3.Connection,
+    *,
+    limite: int | None = None,
+    agora: datetime | None = None,
 ) -> list[sqlite3.Row]:
     """Retorna processos elegíveis pro rastreamento.
 
-    Critério: status em ('pendente', 'julgado_sem_acordao'), tentativas < MAX,
-    url_consulta não-nula. Ordenado por menos tentativas primeiro.
+    Status em ('pendente', 'julgado_sem_acordao'), url_consulta não-nula,
+    tentativas < MAX_TENTATIVAS_ABSOLUTO e:
+      - fase diária: tentativas < TENTATIVAS_FASE_DIARIA; ou
+      - fase semanal: último rastreio há mais de INTERVALO_SEMANAL_DIAS dias.
+    Ordenado por menos tentativas primeiro.
     """
+    if agora is None:
+        agora = datetime.now().astimezone()
+    limite_semanal = (
+        agora - timedelta(days=INTERVALO_SEMANAL_DIAS)
+    ).isoformat(timespec="seconds")
     sql = """
-        SELECT id, codigo_processo, url_consulta, status_acordao, tentativas_rastreador
+        SELECT id, codigo_processo, numero_unificado, classe,
+               url_consulta, status_acordao, tentativas_rastreador
           FROM processo_pautado
          WHERE status_acordao IN (?, ?)
-           AND tentativas_rastreador < ?
            AND url_consulta IS NOT NULL AND url_consulta != ''
+           AND tentativas_rastreador < ?
+           AND (
+                tentativas_rastreador < ?
+                OR ultimo_rastreio_em < ?
+           )
          ORDER BY tentativas_rastreador ASC, id ASC
     """
-    params: list = [*STATUS_PROCESSAVEIS, MAX_TENTATIVAS]
+    params: list = [
+        *STATUS_PROCESSAVEIS,
+        MAX_TENTATIVAS_ABSOLUTO,
+        TENTATIVAS_FASE_DIARIA,
+        limite_semanal,
+    ]
     if limite is not None:
         sql += " LIMIT ?"
         params.append(limite)
@@ -256,6 +290,44 @@ def _registrar_erro(conn: sqlite3.Connection, processo_pautado_id: int) -> None:
     )
 
 
+def _avisar_abandonados(processos: list[sqlite3.Row]) -> None:
+    """Avisa no Telegram os processos que saíram da fila sem acórdão.
+
+    Não levanta: credencial ausente ou falha de envio viram aviso no
+    stderr, pra não derrubar o rastreador.
+    """
+    creds = telegram.ler_credenciais()
+    if creds is None:
+        print(
+            "AVISO: telegram: credenciais ausentes — aviso de abandono não enviado",
+            file=sys.stderr,
+        )
+        return
+    token, chat_id = creds
+    max_listados = 30
+    linhas = [
+        f"⚠️ agente-tjms: {len(processos)} processo(s) sem acórdão após ~6 meses",
+        "",
+        "Saíram da fila de rastreamento sem acórdão publicado:",
+    ]
+    for p in processos[:max_listados]:
+        numero = p["numero_unificado"] or p["codigo_processo"]
+        classe = p["classe"] or "Processo"
+        linhas.append(f"• {classe} {numero}")
+    if len(processos) > max_listados:
+        linhas.append(f"… e mais {len(processos) - max_listados}")
+    linhas.append("")
+    linhas.append("Convém verificar manualmente no e-SAJ.")
+    try:
+        telegram.enviar_mensagem(token, chat_id, "\n".join(linhas))
+        print("telegram: aviso de abandono enviado")
+    except telegram.TelegramError as e:
+        print(
+            f"AVISO: telegram: falha ao enviar aviso de abandono — {e}",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     conn = get_conn()
@@ -266,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
         "sob_segredo": 0, "pendente": 0, "erro": 0,
     }
     erros: list[str] = []
+    abandonados: list[sqlite3.Row] = []
 
     try:
         fila = selecionar_fila(conn, limite=args.limite)
@@ -277,17 +350,18 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     html = client.baixar_pagina_processo(row["url_consulta"])
                     resultado = parse_html(html)
-                    status = resultado["status"]
+                    status_final = resultado["status"]
                     if not args.dry_run:
                         with conn:  # transação por processo
                             aplicar_resultado(conn, row["id"], resultado)
-                    contadores[status] += 1
+                    contadores[status_final] += 1
                     print(
-                        f"  [{i:>3}/{len(fila)}] {row['codigo_processo']} → {status}"
+                        f"  [{i:>3}/{len(fila)}] {row['codigo_processo']} → {status_final}"
                     )
                 except Exception as e:
                     contadores["erro"] += 1
                     erros.append(f"{row['codigo_processo']}: {e}")
+                    status_final = row["status_acordao"]
                     if not args.dry_run:
                         with conn:
                             _registrar_erro(conn, row["id"])
@@ -295,6 +369,13 @@ def main(argv: list[str] | None = None) -> int:
                         f"  [{i:>3}/{len(fila)}] {row['codigo_processo']} → ERRO: {e}",
                         file=sys.stderr,
                     )
+
+                # Cruzou o teto absoluto nesta execução e segue sem acórdão.
+                if (
+                    status_final in STATUS_PROCESSAVEIS
+                    and row["tentativas_rastreador"] + 1 >= MAX_TENTATIVAS_ABSOLUTO
+                ):
+                    abandonados.append(row)
 
                 if i < len(fila):
                     time.sleep(args.throttle)
@@ -312,16 +393,30 @@ def main(argv: list[str] | None = None) -> int:
             + "  ".join(f"{k}={v}" for k, v in contadores.items())
         )
 
+        if abandonados:
+            print(
+                f"abandonados (>= {MAX_TENTATIVAS_ABSOLUTO} tentativas): "
+                f"{len(abandonados)}"
+            )
+            if not args.dry_run:
+                _avisar_abandonados(abandonados)
+
         if execucao_id is not None:
             log_execucao_fim(
                 conn, execucao_id,
                 status=status_global,
-                mensagem=("; ".join(erros[:5]) + (f" (+{len(erros)-5})" if len(erros) > 5 else "")) if erros else None,
+                mensagem=(
+                    "; ".join(erros[:5])
+                    + (f" (+{len(erros) - 5})" if len(erros) > 5 else "")
+                )
+                if erros
+                else None,
                 metricas={
                     "total": len(fila),
                     "limite": args.limite,
                     "throttle_s": args.throttle,
                     "contadores": contadores,
+                    "abandonados": len(abandonados),
                 },
             )
         return 0 if status_global == "ok" else 1

@@ -26,7 +26,7 @@ Três módulos independentes, compartilhando `config`, `client` HTTP e `db`.
 | Módulo | Responsabilidade | Periodicidade |
 |---|---|---|
 | `coletor_pauta` | Para cada órgão, lista sessões agendadas, filtra `dtPauta ∈ [hoje−7d, hoje]` e coleta os processos paginados; upsert em `sessao` + `processo_pautado`. | **Diário, 04:30** — idempotente; protege contra remarcação de sessão de última hora. |
-| `rastreador_acordao` | Para cada `processo_pautado` com `status_acordao` em `pendente`/`julgado_sem_acordao`, baixa o HTML CPOSG5 e extrai ementa inline; upsert em `acordao` e atualiza `status_acordao`. Cap de 10 tentativas por processo. | Diário, 21:00. |
+| `rastreador_acordao` | Para cada `processo_pautado` com `status_acordao` em `pendente`/`julgado_sem_acordao`, baixa o HTML CPOSG5 e extrai ementa inline; upsert em `acordao` e atualiza `status_acordao`. Rastreio diário nos primeiros 10 dias, depois semanal por ~6 meses; processo sem acórdão após esse prazo sai da fila e gera aviso no Telegram. | Diário, 21:00. |
 | `relatorio` | Lê o DB e gera Markdown (com redação de privacidade) + JSON (íntegro) em `data/relatorios/{AAAA-WW}.{md,json}`. Filtro: `dt_publicacao_dje` na semana civil anterior. | Semanal, segunda 07:00. |
 
 ### Particularidades técnicas (descobertas no discovery)
@@ -44,7 +44,7 @@ Três módulos independentes, compartilhando `config`, `client` HTTP e `db`.
 1. **systemd-timer** (user) dispara `agente-tjms coletar` às 04:30 (diário).
 2. Para cada um dos 6 `cdOrgaoJulgador`, chama `GET /sessao-agendada?cdForo=900&cdOrgaoJulgador=X` e filtra sessões com `dtPauta` em [hoje−7d, hoje].
 3. Para cada sessão filtrada: chama `GET /processo-em-pauta?cdOrgaoJulgador=X&nuSessao=Y&nuSeqSessao=Z&paginacao.tamanhoPagina=0` (resposta única com todos os processos); upsert em `sessao` e `processo_pautado`.
-4. Às 21:00 (diário) dispara `agente-tjms rastrear-acordaos`: para cada `processo_pautado` em `pendente`/`julgado_sem_acordao` com `tentativas_rastreador < 10`, baixa o HTML CPOSG5 e extrai a ementa inline; upsert em `acordao` (`status='publicado'`) ou atualiza `status_acordao` (`sob_segredo` / `julgado_sem_acordao` / `pendente`).
+4. Às 21:00 (diário) dispara `agente-tjms rastrear-acordaos`: seleciona os `processo_pautado` em `pendente`/`julgado_sem_acordao` ainda dentro da janela de rastreamento — fase diária (`tentativas_rastreador < 10`) ou fase semanal (até 36 tentativas, no máximo 1×/semana) — baixa o HTML CPOSG5 e extrai a ementa inline; upsert em `acordao` (`status='publicado'`) ou atualiza `status_acordao` (`sob_segredo` / `julgado_sem_acordao` / `pendente`). Processos que atingem 36 tentativas sem acórdão saem da fila e geram um aviso no Telegram.
 5. Segunda 07:00 dispara `agente-tjms relatorio`: filtra `acordao.dt_publicacao_dje` na semana civil anterior (seg-dom TZ Campo Grande) e grava `data/relatorios/{AAAA-WW}.md` + `.json`.
 6. Cada execução loga uma linha em `execucao` com métricas, avisos e status.
 
