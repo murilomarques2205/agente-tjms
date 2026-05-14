@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from . import relatorio_docx, telegram
 from .config import PROJECT_ROOT
 from .db import get_conn, log_execucao_fim, log_execucao_inicio
 
@@ -190,6 +191,66 @@ def gerar_md(processos: list[dict], *, de: date, ate: date, label: str) -> str:
     return "\n".join(linhas) + "\n"
 
 
+def _resumo_telegram(
+    processos: list[dict], *, de: date, ate: date, label: str
+) -> str:
+    """Mensagem-resumo curta pro Telegram (sempre cabe no limite de 4096)."""
+    de_br = de.strftime("%d/%m/%Y")
+    ate_br = ate.strftime("%d/%m/%Y")
+    total = len(processos)
+    if total == 0:
+        return (
+            f"📋 Relatório semanal — {label}\n"
+            f"{de_br} a {ate_br}\n\n"
+            "Nenhum acórdão publicado nesta semana."
+        )
+    por_orgao: dict[str, int] = {}
+    for p in processos:
+        nome = p["orgao"]["nome"]
+        por_orgao[nome] = por_orgao.get(nome, 0) + 1
+    linhas = [
+        f"📋 Relatório semanal — {label}",
+        f"{de_br} a {ate_br}",
+        "",
+        f"Total: {total} acórdão(s)",
+        "",
+        "Por órgão:",
+    ]
+    for nome in sorted(por_orgao):
+        linhas.append(f"• {nome}: {por_orgao[nome]}")
+    linhas.append("")
+    linhas.append("Documento completo em anexo.")
+    return "\n".join(linhas)
+
+
+def _enviar_telegram(
+    processos: list[dict], *, de: date, ate: date, label: str, docx_path: Path
+) -> str:
+    """Envia resumo + .docx pro Telegram. Retorna status pra métricas.
+
+    Não levanta: credenciais ausentes ou falha de envio viram aviso no
+    stderr + string de status, pra não derrubar a geração do relatório.
+    """
+    creds = telegram.ler_credenciais()
+    if creds is None:
+        msg = "credenciais ausentes no ambiente — envio pulado"
+        print(f"AVISO: telegram: {msg}", file=sys.stderr)
+        return msg
+    token, chat_id = creds
+    resumo = _resumo_telegram(processos, de=de, ate=ate, label=label)
+    try:
+        telegram.enviar_mensagem(token, chat_id, resumo)
+        if processos:
+            telegram.enviar_documento(
+                token, chat_id, docx_path, legenda=f"Relatório {label}"
+            )
+        print("telegram: enviado")
+        return "ok"
+    except telegram.TelegramError as e:
+        print(f"AVISO: telegram: falha no envio — {e}", file=sys.stderr)
+        return f"erro: {e}"
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="relatorio",
@@ -214,6 +275,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--dry-run", action="store_true",
         help="Não grava arquivos; imprime o MD no stdout.",
+    )
+    p.add_argument(
+        "--telegram", action="store_true",
+        help="Após gerar, envia resumo + .docx pro Telegram (usa env AGENTE_TJMS_TG_*).",
     )
     return p.parse_args(argv)
 
@@ -262,14 +327,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"escrito: {md_path}")
         print(f"escrito: {json_path}")
 
-        if execucao_id is not None:
-            log_execucao_fim(
-                conn, execucao_id, status="ok",
-                metricas={
-                    "semana": label, "de": de.isoformat(), "ate": ate.isoformat(),
-                    "total": len(brutos), "redatados": n_redatados,
-                },
+        docx_path = saida_dir / f"{label}.docx"
+        relatorio_docx.gerar_docx(
+            brutos, de=de, ate=ate, label=label, saida_path=docx_path
+        )
+        print(f"escrito: {docx_path}")
+
+        telegram_status = None
+        if args.telegram:
+            telegram_status = _enviar_telegram(
+                brutos, de=de, ate=ate, label=label, docx_path=docx_path
             )
+
+        if execucao_id is not None:
+            metricas = {
+                "semana": label, "de": de.isoformat(), "ate": ate.isoformat(),
+                "total": len(brutos), "redatados": n_redatados,
+            }
+            if telegram_status is not None:
+                metricas["telegram"] = telegram_status
+            log_execucao_fim(conn, execucao_id, status="ok", metricas=metricas)
         return 0
     except Exception as e:
         if execucao_id is not None:

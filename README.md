@@ -251,10 +251,10 @@ Setup (uma vez):
 #      e copie result[0].message.chat.id da resposta
 
 # 2. instalar config gitignored
-mkdir -p ~/.config
-cp deploy/systemd/agente-tjms.env.example ~/.config/agente-tjms.env
-chmod 600 ~/.config/agente-tjms.env
-$EDITOR ~/.config/agente-tjms.env   # preencher AGENTE_TJMS_HOME, _TG_TOKEN, _TG_CHAT_ID
+mkdir -p ~/.config/agente-tjms
+cp deploy/systemd/agente-tjms.env.example ~/.config/agente-tjms/agente-tjms.env
+chmod 600 ~/.config/agente-tjms/agente-tjms.env
+$EDITOR ~/.config/agente-tjms/agente-tjms.env   # preencher AGENTE_TJMS_HOME, _TG_TOKEN, _TG_CHAT_ID
 
 # 3. instalar template do alerta
 cp deploy/systemd/alerta@.service ~/.config/systemd/user/
@@ -267,7 +267,7 @@ journalctl --user -u alerta@coletor.service -n 20
 
 Como funciona:
 - Cada um dos 3 services existentes tem `OnFailure=alerta@%N.service` em `[Unit]`. Quando termina com `exit != 0`, systemd instancia o template.
-- O template lê `~/.config/agente-tjms.env`, invoca `deploy/systemd/alerta.sh <job>`, que monta o payload (última row de `execucao` + últimas 15 linhas do journal) e faz `curl` pro Telegram.
+- O template lê `~/.config/agente-tjms/agente-tjms.env`, invoca `deploy/systemd/alerta.sh <job>`, que monta o payload (última row de `execucao` + últimas 15 linhas do journal) e faz `curl` pro Telegram.
 - Falhas do próprio alerta (token inválido, sem rede) ficam no journal de `alerta@<job>.service` e não afetam os jobs originais.
 
 ## Status

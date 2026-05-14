@@ -3,5 +3,5 @@ Description=agente-tjms: alerta de falha do %i.service
 
 [Service]
 Type=oneshot
-EnvironmentFile=-%h/.config/agente-tjms.env
+EnvironmentFile=-%h/.config/agente-tjms/agente-tjms.env
 ExecStart=%h/projetos/agente-tjms/deploy/systemd/alerta.sh %i

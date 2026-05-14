@@ -3,7 +3,7 @@
 # Uso: alerta.sh <nome-do-job>     (ex.: alerta.sh coletor)
 # Acionado via OnFailure=alerta@%N.service nos services do agente.
 #
-# Variáveis lidas do EnvironmentFile (~/.config/agente-tjms.env):
+# Variáveis lidas do EnvironmentFile (~/.config/agente-tjms/agente-tjms.env):
 #   AGENTE_TJMS_HOME           path absoluto do repo
 #   AGENTE_TJMS_TG_TOKEN       token do bot Telegram
 #   AGENTE_TJMS_TG_CHAT_ID     chat ID destino
