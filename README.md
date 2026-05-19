@@ -196,7 +196,80 @@ _Acrescidos na Sessão 3 (correção da premissa errada da Sessão 2):_
 - **`partes_json` estruturado** como `{"ativa": {tipo,nome,nome_social}|null, "passiva": ...}` em vez de array bruto.
 - **Migração via `_migrate()` idempotente** (`ALTER TABLE ADD COLUMN` por coluna nova, gateada por `PRAGMA table_info`).
 
-## Agendamento (systemd-timer, user)
+## Agendamento (Windows + WSL — recomendado: Task Scheduler)
+
+Em Windows + WSL, o `systemd-timer` interno só roda enquanto o WSL está em execução; o WSL desliga sozinho quando ocioso e fica suspenso até alguém abrir um terminal Ubuntu (ou outro processo iniciar o WSL). Pra evitar que os agendamentos sejam perdidos, registramos os 3 jobs no **Windows Task Scheduler**, que aciona o WSL automaticamente na hora marcada.
+
+### Wrapper
+
+`scripts/run-via-task-scheduler.sh` é o ponto de entrada chamado por cada tarefa: carrega `~/.config/agente-tjms/agente-tjms.env`, executa o subcomando do `agente-tjms`, loga tudo em `logs/task-scheduler.log` e — em caso de falha — manda alerta no Telegram com a cauda do log (substitui o `OnFailure` do systemd nesse modo). Propaga o código de saída pro Task Scheduler.
+
+### Registrar as tarefas (PowerShell, uma vez)
+
+Troque `SEU_USUARIO` pelo seu usuário Linux dentro do WSL antes de rodar.
+
+```powershell
+$wsl = "$env:SystemRoot\System32\wsl.exe"
+$scriptPath = "/home/SEU_USUARIO/projetos/agente-tjms/scripts/run-via-task-scheduler.sh"
+
+$jobs = @(
+    @{ Name='agente-tjms-coletor'
+       Trigger=(New-ScheduledTaskTrigger -Daily -At '04:30')
+       Args="-d Ubuntu -u SEU_USUARIO -- bash $scriptPath coletar" },
+    @{ Name='agente-tjms-rastreador'
+       Trigger=(New-ScheduledTaskTrigger -Daily -At '21:00')
+       Args="-d Ubuntu -u SEU_USUARIO -- bash $scriptPath rastrear-acordaos" },
+    @{ Name='agente-tjms-relatorio'
+       Trigger=(New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '07:00')
+       Args="-d Ubuntu -u SEU_USUARIO -- bash $scriptPath relatorio --telegram" }
+)
+
+$settings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable -WakeToRun `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME `
+    -LogonType Interactive -RunLevel Limited
+
+foreach ($job in $jobs) {
+    $action = New-ScheduledTaskAction -Execute $wsl -Argument $job.Args
+    Register-ScheduledTask -TaskName $job.Name -Action $action `
+        -Trigger $job.Trigger -Settings $settings -Principal $principal -Force | Out-Null
+}
+```
+
+Opções-chave:
+- `-StartWhenAvailable`: dispara o job perdido assim que possível depois (ex.: PC ligado às 9h roda o agendamento de 7h da mesma manhã).
+- `-WakeToRun`: acorda o PC se estiver dormindo na hora marcada.
+- `-LogonType Interactive`: roda quando o usuário Windows está logado.
+
+### Verificação e operação
+
+```powershell
+# listar
+Get-ScheduledTask -TaskName 'agente-tjms-*' | Format-Table TaskName, State
+
+# rodar manualmente
+Start-ScheduledTask -TaskName 'agente-tjms-coletor'
+
+# último resultado
+Get-ScheduledTaskInfo -TaskName 'agente-tjms-coletor' |
+    Format-List LastRunTime, LastTaskResult, NextRunTime
+
+# desinstalar
+Get-ScheduledTask -TaskName 'agente-tjms-*' | Unregister-ScheduledTask -Confirm:$false
+```
+
+Logs (dentro do WSL):
+
+```bash
+tail -f ~/projetos/agente-tjms/logs/task-scheduler.log
+```
+
+---
+
+## Agendamento (alternativa: systemd-timer dentro do WSL ou Linux nativo)
 
 Os 3 jobs rodam como **user units** do systemd (sem `sudo`, sem root). Pré-requisitos: projeto em `~/projetos/agente-tjms/` com `.venv/` configurado (`pip install -e ".[dev]"`). Se seu layout difere, edite `WorkingDirectory` e `ExecStart` nos `.service` antes de instalar.
 
