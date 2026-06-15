@@ -74,6 +74,27 @@ def selecionar_acordaos(
     return conn.execute(sql, (de.isoformat(), ate.isoformat())).fetchall()
 
 
+def relatorio_telegram_ja_enviado(
+    conn: sqlite3.Connection, *, label: str
+) -> bool:
+    """Indica se já existe execução do relatório que enviou esse label pro
+    Telegram com sucesso. Usado pra evitar reenvio em catch-up automático."""
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM execucao
+         WHERE modulo = 'relatorio'
+           AND status = 'ok'
+           AND metricas_json IS NOT NULL
+           AND json_extract(metricas_json, '$.semana') = ?
+           AND json_extract(metricas_json, '$.telegram') = 'ok'
+         LIMIT 1
+        """,
+        (label,),
+    ).fetchone()
+    return row is not None
+
+
 def _processo_para_dict(row: sqlite3.Row) -> dict:
     """Normaliza Row em dict pronto pra JSON, parseando partes_json."""
     partes = json.loads(row["partes_json"]) if row["partes_json"] else None
@@ -280,6 +301,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--telegram", action="store_true",
         help="Após gerar, envia resumo + .docx pro Telegram (usa env AGENTE_TJMS_TG_*).",
     )
+    p.add_argument(
+        "--forcar-telegram", action="store_true",
+        help="Força envio pro Telegram mesmo se a semana já foi enviada (override do dedupe).",
+    )
     return p.parse_args(argv)
 
 
@@ -335,9 +360,20 @@ def main(argv: list[str] | None = None) -> int:
 
         telegram_status = None
         if args.telegram:
-            telegram_status = _enviar_telegram(
-                brutos, de=de, ate=ate, label=label, docx_path=docx_path
+            ja_enviado = (
+                not args.forcar_telegram
+                and relatorio_telegram_ja_enviado(conn, label=label)
             )
+            if ja_enviado:
+                telegram_status = (
+                    "ja enviado anteriormente — pulado "
+                    "(use --forcar-telegram pra reenviar)"
+                )
+                print(f"telegram: {telegram_status}")
+            else:
+                telegram_status = _enviar_telegram(
+                    brutos, de=de, ate=ate, label=label, docx_path=docx_path
+                )
 
         if execucao_id is not None:
             metricas = {

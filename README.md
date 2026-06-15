@@ -209,40 +209,67 @@ Em Windows + WSL, o `systemd-timer` interno só roda enquanto o WSL está em exe
 Troque `SEU_USUARIO` pelo seu usuário Linux dentro do WSL antes de rodar.
 
 ```powershell
+# Pede a senha do Windows uma vez — vai pro Credential Manager (criptografada).
+$pwSecure = Read-Host "Senha do Windows para $env:USERNAME" -AsSecureString
+$plainPw = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwSecure)
+)
+
 $wsl = "$env:SystemRoot\System32\wsl.exe"
 $scriptPath = "/home/SEU_USUARIO/projetos/agente-tjms/scripts/run-via-task-scheduler.sh"
+$userLogon = "$env:USERDOMAIN\$env:USERNAME"
 
 $jobs = @(
     @{ Name='agente-tjms-coletor'
-       Trigger=(New-ScheduledTaskTrigger -Daily -At '04:30')
+       Triggers=@(
+           (New-ScheduledTaskTrigger -Daily -At '04:30'),
+           (New-ScheduledTaskTrigger -AtLogOn -User $userLogon)
+       )
        Args="-d Ubuntu -u SEU_USUARIO -- bash $scriptPath coletar" },
     @{ Name='agente-tjms-rastreador'
-       Trigger=(New-ScheduledTaskTrigger -Daily -At '21:00')
+       Triggers=@(
+           (New-ScheduledTaskTrigger -Daily -At '21:00'),
+           (New-ScheduledTaskTrigger -AtLogOn -User $userLogon)
+       )
        Args="-d Ubuntu -u SEU_USUARIO -- bash $scriptPath rastrear-acordaos" },
     @{ Name='agente-tjms-relatorio'
-       Trigger=(New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '07:00')
+       Triggers=@(
+           (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '09:00'),
+           (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '10:00'),
+           (New-ScheduledTaskTrigger -AtLogOn -User $userLogon)
+       )
        Args="-d Ubuntu -u SEU_USUARIO -- bash $scriptPath relatorio --telegram" }
 )
 
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable -WakeToRun `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1)
-
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME `
-    -LogonType Interactive -RunLevel Limited
+    -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+    -MultipleInstances IgnoreNew
 
 foreach ($job in $jobs) {
     $action = New-ScheduledTaskAction -Execute $wsl -Argument $job.Args
     Register-ScheduledTask -TaskName $job.Name -Action $action `
-        -Trigger $job.Trigger -Settings $settings -Principal $principal -Force | Out-Null
+        -Trigger $job.Triggers -Settings $settings `
+        -User $userLogon -Password $plainPw -RunLevel Limited -Force | Out-Null
 }
 ```
 
 Opções-chave:
-- `-StartWhenAvailable`: dispara o job perdido assim que possível depois (ex.: PC ligado às 9h roda o agendamento de 7h da mesma manhã).
+- `-StartWhenAvailable`: dispara o job perdido assim que possível depois (ex.: PC ligado às 9h30 roda o agendamento perdido de 9h).
 - `-WakeToRun`: acorda o PC se estiver dormindo na hora marcada.
-- `-LogonType Interactive`: roda quando o usuário Windows está logado.
+- `-User`/`-Password`: senha do Windows vai pro Credential Manager (criptografada, só o Windows local lê). A tarefa roda **mesmo sem usuário logado**.
+- Trigger `-AtLogOn`: rede de segurança — se a hora marcada falhar, dispara assim que você logar.
+- Dois triggers semanais no `relatorio` (Mon 09:00 + Mon 10:00): primeira tentativa + retry uma hora depois. O **dedupe** (abaixo) impede envio duplicado.
+- `-MultipleInstances IgnoreNew`: se a tarefa já estiver rodando, ignora disparos novos.
+
+### Dedupe de envio do relatório
+
+O comando `relatorio --telegram` registra cada envio bem-sucedido em `execucao` (`semana` + `telegram=ok`). Antes de enviar, consulta esse histórico — **se a semana já foi enviada, o envio é pulado** (mas os arquivos `.md/.json/.docx` são regerados normalmente).
+
+Isso evita duplicação quando o Task Scheduler dispara mais de uma vez (retry, catch-up tardio) ou um envio manual antecede o agendamento.
+
+Para forçar reenvio (ex.: arquivo perdido): `agente-tjms relatorio --telegram --forcar-telegram --semana 2026-W23`.
 
 ### Verificação e operação
 

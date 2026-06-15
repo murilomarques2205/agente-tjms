@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import date
 
+from agente_tjms.db import init_db, log_execucao_fim, log_execucao_inicio
 from agente_tjms.relatorio import (
     REDATADO,
     aplicar_privacidade,
     calcular_janela,
     gerar_json,
     gerar_md,
+    relatorio_telegram_ja_enviado,
 )
 
 
@@ -124,3 +127,57 @@ def test_gerar_json_inclui_metadados_total_e_acordaos():
     assert out["total"] == 1
     assert out["acordaos"] == [p]
     assert "gerado_em" in out
+
+
+# === dedupe de envio ao Telegram ===
+
+
+def _conn_teste() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    return conn
+
+
+def _registrar_execucao(conn, *, label: str, telegram: str | None) -> int:
+    """Simula uma execução do relatório como se já tivesse rodado."""
+    eid = log_execucao_inicio(conn, "relatorio")
+    metricas = {"semana": label}
+    if telegram is not None:
+        metricas["telegram"] = telegram
+    log_execucao_fim(conn, eid, status="ok", metricas=metricas)
+    return eid
+
+
+def test_relatorio_telegram_ja_enviado_detecta_sucesso():
+    conn = _conn_teste()
+    _registrar_execucao(conn, label="2026-W23", telegram="ok")
+    assert relatorio_telegram_ja_enviado(conn, label="2026-W23") is True
+
+
+def test_relatorio_telegram_ja_enviado_ignora_semana_diferente():
+    conn = _conn_teste()
+    _registrar_execucao(conn, label="2026-W22", telegram="ok")
+    assert relatorio_telegram_ja_enviado(conn, label="2026-W23") is False
+
+
+def test_relatorio_telegram_ja_enviado_ignora_execucao_sem_telegram():
+    conn = _conn_teste()
+    _registrar_execucao(conn, label="2026-W23", telegram=None)
+    assert relatorio_telegram_ja_enviado(conn, label="2026-W23") is False
+
+
+def test_relatorio_telegram_ja_enviado_ignora_erro_no_telegram():
+    conn = _conn_teste()
+    _registrar_execucao(conn, label="2026-W23", telegram="erro: timeout")
+    assert relatorio_telegram_ja_enviado(conn, label="2026-W23") is False
+
+
+def test_relatorio_telegram_ja_enviado_ignora_marcador_de_skip():
+    """O próprio marker de 'ja enviado' não pode contar como envio."""
+    conn = _conn_teste()
+    _registrar_execucao(
+        conn, label="2026-W23",
+        telegram="ja enviado anteriormente — pulado (use --forcar-telegram pra reenviar)",
+    )
+    assert relatorio_telegram_ja_enviado(conn, label="2026-W23") is False
